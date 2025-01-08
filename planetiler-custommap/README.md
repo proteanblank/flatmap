@@ -5,9 +5,9 @@ file as the first argument:
 
 ```bash
 # from a java build
-java -jar planetiler.jar schema.yml
+java -jar planetiler.jar generate-custom --schema=schema.yml
 # or with docker (put the schema in data/schema.yml to include in the attached volume)
-docker run -v "$(pwd)/data":/data ghcr.io/onthegomap/planetiler:latest /data/schema.yml
+docker run -v "$(pwd)/data":/data ghcr.io/onthegomap/planetiler:latest generate-custom --schema=/data/schema.yml
 ```
 
 Schema files are in [YAML 1.2](https://yaml.org) format and support [anchors and aliases](#anchors-and-aliases) for
@@ -57,12 +57,17 @@ examples: [...]
 A description that tells planetiler how to read geospatial objects with tags from an input file.
 
 - `type` - Enum representing the file format of the data source, one
-  of [`osm`](https://wiki.openstreetmap.org/wiki/PBF_Format) or [`shapefile`](https://en.wikipedia.org/wiki/Shapefile)
+  of [`osm`](https://wiki.openstreetmap.org/wiki/PBF_Format), [`shapefile`](https://en.wikipedia.org/wiki/Shapefile),
+  or [`geopackage`](https://www.geopackage.org/).
 - `local_path` - Local path to the file to use, inferred from `url` if missing. Can be a string
   or [expression](#expression) that can reference [argument values](#arguments).
 - `url` - Location to download the file from if not present at `local_path`.
   For [geofabrik](https://download.geofabrik.de/) named areas, use `geofabrik:`  prefixes, for
   example `geofabrik:rhode-island`. Can be a string or [expression](#expression) that can
+  reference [argument values](#arguments).
+- `projection` - Planetiler will try to determine the projection automatically for shapefile/geopackage sources, but if
+  that is not correct you can override the projection by specifying a coordinate reference system authority code
+  like `EPSG:3857` or `EPSG:4326` here. Can be a string or [expression](#expression) that can
   reference [argument values](#arguments).
 
 For example:
@@ -131,7 +136,7 @@ to `france.osm.pbf`. Planetiler searches for argument values in this order:
 3. Environmental variables with "PLANETILER_" prefix: `PLANETILER_AREA=france java ...`
 4. Default value from the config
 
-Argument values are available from the [`args` variable](#root-context) in
+Argument values are available from the [`args` variable](#1-root-context) in
 an [inline script expression](#inline-script-expression) or the [`arg_value` expression](#argument-value-expression).
 
 ### Built-in arguments
@@ -150,11 +155,8 @@ cat planetiler-custommap/planetiler.schema.json | jq -r '.properties.args.proper
 - `minzoom` - Minimum tile zoom level to emit
 - `maxzoom` - Maximum tile zoom level to emit
 - `render_maxzoom` - Maximum rendering zoom level up to
-- `skip_mbtiles_index_creation` - Skip adding index to mbtiles file
-- `optimize_db` - Vacuum analyze mbtiles file after writing
-- `emit_tiles_in_order` - Emit vector tiles in index order
 - `force` - Overwriting output file and ignore warnings
-- `gzip_temp` - Gzip temporary feature storage (uses more CPU, but less disk space)
+- `compress_temp` - Gzip temporary feature storage (uses more CPU, but less disk space)
 - `mmap_temp` - Use memory-mapped IO for temp feature files
 - `sort_max_readers` - Maximum number of concurrent read threads to use when sorting chunks
 - `sort_max_writers` - Maximum number of concurrent write threads to use when sorting chunks
@@ -175,7 +177,6 @@ cat planetiler-custommap/planetiler.schema.json | jq -r '.properties.args.proper
   maximum zoom level to allow for overzooming
 - `simplify_tolerance` - Default value for the tile pixel tolerance to use when simplifying features below the maximum
   zoom level
-- `compact_db` - Reduce the DB size by separating and deduping the tile data
 - `skip_filled_tiles` - Skip writing tiles containing only polygon fills to the output
 - `tile_warning_size_mb` - Maximum size in megabytes of a tile to emit a warning about
 
@@ -195,6 +196,8 @@ A layer contains a thematically-related set of features from one or more input s
 
 - `id` - Unique name of this layer
 - `features` - A list of features contained in this layer. See [Layer Features](#layer-feature)
+- `tile_post_process` - Optional processing operations to merge features with the same attributes in a rendered tile.
+  See [Tile Post Process](#tile-post-process)
 
 For example:
 
@@ -204,27 +207,40 @@ layers:
     features:
       - { ... }
       - { ... }
+    tile_post_process:
+      merge_line_strings:
+        min_length: 1
+        tolerance: 1
+        buffer: 5
 ```
 
 ## Layer Feature
 
 A feature is a defined set of objects that meet a specified filter criteria.
 
-- `source` - A string [source](#source) ID, or list of source IDs from which features should be extracted
+- `source` - A string [source](#source) ID, or list of source IDs from which features should be extracted. If missing,
+  features from all sources are included.
 - `geometry` - A string enum that indicates which geometry types to include, and how to transform them. Can be one
   of:
   - `point` `line` or `polygon` to pass the original feature through
+  - `any` (default) to pass the original feature through regardless of geometry type
   - `polygon_centroid` to match on polygons, and emit a point at the center
+  - `line_centroid` to match on lines, and emit a point at the centroid of the line
+  - `line_midpoint` to match on lines, and emit a point at midpoint of the line
+  - `centroid` to match any geometry, and emit a point at the center
   - `polygon_point_on_surface` to match on polygons, and emit an interior point
+  - `point_on_line` to match on lines, and emit a point somewhere along the line
   - `polygon_centroid_if_convex` to match on polygons, and if the polygon is convex emit the centroid, otherwise emit an
     interior point
-- `min_tile_cover_size` - Include objects of a certain geometry size, where 1.0 means "is
-  the same size as a tile at this zoom"
+  - `innermost_point` to match on any geometry and for polygons, emit the furthest point from an edge, or for lines emit
+    the midpoint.
 - `include_when` - A [Boolean Expression](#boolean-expression) which determines the features to include.
   If unspecified, all features from the specified sources are included.
 - `exclude_when` - A [Boolean Expression](#boolean-expression) which determines if a feature that matched the include
   expression should be skipped. If unspecified, no exclusion filter is applied.
 - `min_zoom` - An [Expression](#expression) that returns the minimum zoom to render this feature at.
+- `min_size` - An [Expression](#expression) that returns the minimum length of line features or square root of the
+  minimum area of polygon features to emit below the maximum zoom-level of the map.
 - `attributes` - An array of [Feature Attribute](#feature-attribute) objects that specify the attributes to be included
   on this output feature.
 
@@ -259,6 +275,8 @@ Defines an attribute to include on an output vector tile feature and how to comp
   minimum zoom for each output value.
 - `type` - The [Data Type](#data-type) to coerce the value to, or `match_key` to set this attribute to the key that
   triggered the match in the include expression, or `match_value` to set it to the value for the matching key.
+- `min_tile_cover_size` - Include this attribute only on geometries over a certain size at a given zoom level, where 1.0
+  means the entire width of a tile for lines, or area of a tile for polygons.
 
 To define the value, use one of:
 
@@ -278,6 +296,37 @@ min_zoom: 10
 include_when: "${ double(feature.tags.voltage) > 1000 }"
 tag_value: voltage
 type: integer
+```
+
+## Tile Post Process
+
+Specific tile post processing operations for merging features may be defined:
+
+- `merge_line_strings` - Combines linestrings with the same set of attributes into a multilinestring where segments with
+  touching endpoints are merged.
+- `merge_polygons` - Combines polygons with the same set of attributes into a multipolygon where overlapping/touching
+  polygons
+  are combined into fewer polygons covering the same area.
+
+The follow attributes for `merge_line_strings` may be set:
+
+- `min_length` - Minimum tile pixel length of features to emit, or 0 to emit all merged linestrings.
+- `tolerance` - After merging, simplify linestrings using this pixel tolerance, or -1 to skip simplification step.
+- `buffer` - Number of pixels outside the visible tile area to include detail for, or -1 to skip clipping step.
+
+The follow attribute for `merge_polygons` may be set:
+
+- `min_area` - Minimum area in square tile pixels of polygons to emit.
+
+For example:
+
+```yaml
+merge_line_strings:
+  min_length: 1
+  tolerance: 1
+  buffer: 5
+merge_polygons:
+  min_area: 1
 ```
 
 ## Data Type
@@ -365,13 +414,13 @@ value:
   water: otherwise
 ```
 
-If the values are not simple strings, then you can use an array of objects with `if` / `value` / `else` conditions:
+If the values are not simple strings, then you can use an array of objects with `if` and `value` keys and a last object with an `else` key:
 
 ```yaml
 value:
-  - value: 100000
-    if:
+  - if:
       place: city
+    value: 100000
   - value: 5000
     if:
       place: town
@@ -429,39 +478,83 @@ value: "${ 8 * 24 - 2 }"
 
 #### Inline Script Contexts
 
-Scripts are parsed and evaluated inside a "context" that defines the variables available to that script. Contexts are
-nested, so each child context can also access the variables from its parent.
+Scripts are parsed and evaluated inside a "context" that defines the variables available to that script.
 
-> ##### root context
->
-> Available variables:
-> - `args` - a map from [argument](#arguments) name to value, see also [built-in arguments](#built-in-arguments) that
->
->> are always available.
->>
->> ##### process feature context
->>
->> Context available when processing an input feature, for example testing whether to include it from `include_when`.
->> Available variables:
->>
->> - `feature.tags` - map with key/value tags from the input feature
->> - `feature.id` - numeric ID of the input feature
->> - `feature.source` - string source ID this feature came from
->> - `feature.source_layer` - optional layer within the source the feature came from
->>
->>> ##### post-match context
->>>
->>> Context available after a feature has matched, for example computing an attribute value. Adds variables:
->>>
->>> - `match_key` - string tag that triggered a match to include the feature in this layer
->>> - `match_value` - the tag value associated with that key
->>>
->>>> ##### configure attribute context
->>>>
->>>> Context available after the value of an attribute has been computed, for example: set min zoom to render an
->>>> attribute. Adds variables:
->>>>
->>>> - `value` the value that was computed for this key
+**_Notice_**: Contexts are nested, so each child context can also access the variables from its parent.
+
+##### 1. Root Context
+
+Available variables:
+
+- `args` - a map from [argument](#arguments) name to value, see also [built-in arguments](#built-in-arguments) that are
+  always available.
+
+##### 2. Process Feature Context
+
+Context available when processing an input feature, for example testing whether to include it from `include_when`.
+
+Additional variables, on top of the root context:
+
+- `feature.tags` - map with key/value tags from the input feature
+- `feature.id` - numeric ID of the input feature
+- `feature.source` - string source ID this feature came from
+- `feature.source_layer` - optional layer within the source the feature came from
+- `feature.osm_changeset` - optional OSM changeset ID for this feature
+- `feature.osm_version` - optional OSM element version for this feature
+- `feature.osm_timestamp` - optional OSM last modified timestamp for this feature
+- `feature.osm_user_id` - optional ID of the OSM user that last modified this feature
+- `feature.osm_user_name` - optional name of the OSM user that last modified this feature
+- `feature.osm_type` - type of the OSM element as a string: `"node"`, `"way"`, or `"relation"`
+
+On the original feature or any accessor that returns a geometry, you can also use:
+
+- `feature.length("unit")` - length of the feature if it is a line, 0 otherwise. Allowed units: "meters"/"m", "feet"
+  /"ft", "yards"/"yd", "nautical miles"/"nm", "kilometer"/"km" for units relative to the size in meters, or "z0 tiles"/"
+  z0 ti", "z0 pixels"/"z0 px" for sizes relative to the size of the geometry when projected into a z0 web mercator tile
+  containing the entire world.
+- `feature.area("unit")` - area of the feature if it is a polygon, 0 otherwise. Allowed units: any length unit like "
+  km2", "mi2", or "z0 px2" or also "acres"/"ac", "hectares"/"ha", or "ares"/"a".
+- `feature.min_lat` / `feature.min_lon` / `feature.max_lat` / `feature.max_lon` - returns coordinates from the bounding
+  box of this geometry
+- `feature.lat` / `feature.lon` - returns the coordinate of an arbitrary point on this shape (useful to get the lat/lon
+  of a point)
+- `feature.bbox` - returns the rectangle bounding box that contains this entire shape
+- `feature.centroid` - returns the weighted center point of the geometry, which may fall outside the the shape
+- `feature.point_on_surface` - returns a point that is within the shape (on the line, or inside the polygon)
+- `feature.validated_polygon` - if this is a polygon, fixes any self-intersections and returns the result
+- `feature.centroid_if_convex` - returns point_on_surface if this is a concave polygon, or centroid if convex
+- `feature.line_midpoint` - returns midpoint of this feature if it is a line
+- `feature.point_along_line(amount)` - when amount=0 returns the start of the line, when amount=1 returns the end,
+  otherwise a point at a certain ratio along the line
+- `feature.partial_line(start, end)` - returns a partial line segment from start to end where 0=the beginning of the
+  line and 1=the end
+- `feature.innermost_point` / `feature.innermost_point(tolerance)` - returns the midpoint of a line, or
+  the [pole of inaccessibility](https://en.wikipedia.org/wiki/Pole_of_inaccessibility) if it is a polygon
+
+For example:
+
+```yaml
+key: bbox_area_km2
+value: ${ feature.bbox.area('km2') }
+```
+
+##### 3. Post-Match Context
+
+Context available after a feature has matched, for example computing an attribute value.
+
+Additional variables, on top of the process feature context:
+
+- `match_key` - string tag that triggered a match to include the feature in this layer
+- `match_value` - the tag value associated with that key
+
+##### 4. Configure Attribute Context
+
+Context available after the value of an attribute has been computed, for example: set min zoom to render an
+attribute.
+
+Additional variable, on top of the post-match context:
+
+- `value` the value that was computed for this key
 
 For example:
 
@@ -500,7 +593,7 @@ in [PlanetilerStdLib](src/main/java/com/onthegomap/planetiler/custommap/expressi
   - `<string>.replace(from, to, limit)` returns the input string with the first N occurrences of from replaced by to
   - `<string>.replaceRegex(pattern, value)` replaces every occurrence of regular expression with value from the string
     it was called on using java's
-    built-in [replaceAll](<https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/regex/Matcher.html#replaceAll(java.lang.String)>)
+    built-in [replaceAll](<https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/regex/Matcher.html#replaceAll(java.lang.String)>)
     behavior
   - `<string>.split(separator)` returns a list of strings split from the input by a separator
   - `<string>.split(separator, limit)` splits the list into up to N parts
@@ -558,7 +651,7 @@ include_when:
 
 When a feature matches a boolean expression in the `include_when` field, the first key that triggered the match is
 available to other expressions as `match_key` and its value is available as `match_value`
-(See [Post-Match Context](#post-match-context)):
+(See [Post-Match Context](#3-post-match-context)):
 
 ```yaml
 include_when:
@@ -675,6 +768,8 @@ docker run -v "$(pwd)/data":/data ghcr.io/onthegomap/planetiler:latest verify /d
   - `geometry` - Geometry type of the expected output feature.
   - `min_zoom` - Min zoom level that the output feature appears in.
   - `max_zoom` - Max zoom level that the output feature appears in.
+  - `min_size` - Minimum length of line features or square root of the minimum area of polygon features to emit below
+    the maximum zoom-level of the map.
   - `tags` - Attributes expected on the output vector tile feature, or `null` if the attribute should not be set. Use
     `allow_extra_tags: true` to fail if any other tags appear besides the ones specified here.
   - `allow_extra_tags` - If `true`, then fail when extra attributes besides tags appear on the output feature.

@@ -59,9 +59,9 @@ class PrometheusStatsTest {
   @Test
   void testProcessedElement() {
     PrometheusStats stats = new PrometheusStats("job");
-    stats.processedElement("type1", "layer1");
-    stats.processedElement("type1", "layer1");
-    stats.processedElement("type1", "layer2");
+    stats.processedElement("type1", "layer1", 0);
+    stats.processedElement("type1", "layer1", 0);
+    stats.processedElement("type1", "layer2", 0);
     assertContainsStat("^planetiler_renderer_elements_processed_total\\{.*layer1.* 2", stats);
     assertContainsStat("^planetiler_renderer_elements_processed_total\\{.*layer2.* 1", stats);
   }
@@ -91,8 +91,8 @@ class PrometheusStatsTest {
     PrometheusStats stats = new PrometheusStats("job");
     stats.wroteTile(0, 10);
     stats.wroteTile(0, 10_000);
-    assertContainsStat("^planetiler_mbtiles_tile_written_bytes_bucket\\{.*le=\"1000\\..* 1", stats);
-    assertContainsStat("^planetiler_mbtiles_tile_written_bytes_bucket\\{.*le=\"10000\\..* 2", stats);
+    assertContainsStat("^planetiler_archive_tile_written_bytes_bucket\\{.*le=\"1000\\..* 1", stats);
+    assertContainsStat("^planetiler_archive_tile_written_bytes_bucket\\{.*le=\"10000\\..* 2", stats);
   }
 
   @Test
@@ -110,6 +110,16 @@ class PrometheusStatsTest {
     PrometheusStats stats = new PrometheusStats("job");
     stats.monitorInMemoryObject("test", () -> 10);
     assertContainsStat("^planetiler_heap_object_test_size_bytes 10", stats);
+  }
+
+  @Test
+  void captureDataErrors() {
+    PrometheusStats stats = new PrometheusStats("job");
+    assertEquals(Map.of(), stats.dataErrors());
+    stats.dataError("a");
+    stats.dataError("a");
+    stats.dataError("b");
+    assertEquals(Map.of("a", 2L, "b", 1L), stats.dataErrors());
   }
 
   private static Counter.Readable counterAt(int num) {

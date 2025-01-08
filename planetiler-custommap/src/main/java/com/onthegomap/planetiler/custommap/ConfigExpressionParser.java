@@ -86,7 +86,7 @@ public class ConfigExpressionParser<I extends ScriptContext> {
         return cast(signature(output), child, dataType);
       } else {
         var keys = map.keySet();
-        if (keys.equals(Set.of("coalesce")) && map.get("coalesce")instanceof Collection<?> cases) {
+        if (keys.equals(Set.of("coalesce")) && map.get("coalesce") instanceof Collection<?> cases) {
           return coalesce(cases.stream().map(item -> parse(item, output)).toList());
         } else if (keys.equals(Set.of("match"))) {
           return parseMatch(map.get("match"), true, output);
@@ -146,7 +146,7 @@ public class ConfigExpressionParser<I extends ScriptContext> {
     } else {
       throw new ParseException("Invalid match block. Expected a list or map, but got: " + match);
     }
-    return ConfigExpression.match(signature(output), MultiExpression.of(List.copyOf(conditions)), fallback);
+    return ConfigExpression.match(signature(output), MultiExpression.ofOrdered(List.copyOf(conditions)), fallback);
   }
 
   private <O> Signature<I, O> signature(Class<O> outputClass) {

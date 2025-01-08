@@ -17,17 +17,18 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.source>16</maven.compiler.source>
-    <maven.compiler.target>16</maven.compiler.target>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
     <maven.source.excludeResources>true</maven.source.excludeResources>
-    <jackson.version>2.14.1</jackson.version>
-    <junit.version>5.9.1</junit.version>
+    <jackson.version>2.18.2</jackson.version>
+    <junit.version>5.11.4</junit.version>
+    <jts.version>1.20.0</jts.version>
     <sonar.host.url>https://sonarcloud.io</sonar.host.url>
     <sonar.organization>onthegomap</sonar.organization>
     <sonar.projectKey>onthegomap_planetiler</sonar.projectKey>
     <sonar.moduleKey>${project.artifactId}</sonar.moduleKey>
     <sonar.exclusions>planetiler-benchmarks/**/*, planetiler-openmaptiles/**/*</sonar.exclusions>
-    <revision>0.6-SNAPSHOT</revision>
+    <revision>0.8.4-SNAPSHOT</revision>
     <timestamp>${maven.build.timestamp}</timestamp>
   </properties>
 
@@ -85,7 +86,8 @@
 
   <modules>
     <module>planetiler-core</module>
-    <module>planetiler-openmaptiles/submodule.pom.xml</module>
+    <!-- TODO replace with planetiler-openmaptiles/submodule.pom.xml when this is fixed: https://github.com/dependabot/dependabot-core/issues/9193 -->
+    <module>planetiler-openmaptiles.pom.xml</module>
     <module>planetiler-custommap</module>
     <module>planetiler-benchmarks</module>
     <module>planetiler-examples</module>
@@ -95,19 +97,14 @@
   <dependencyManagement>
     <dependencies>
       <dependency>
-        <groupId>org.yaml</groupId>
-        <artifactId>snakeyaml</artifactId>
-        <version>1.33</version>
-      </dependency>
-      <dependency>
         <groupId>org.snakeyaml</groupId>
         <artifactId>snakeyaml-engine</artifactId>
-        <version>2.5</version>
+        <version>2.8</version>
       </dependency>
       <dependency>
         <groupId>org.commonmark</groupId>
         <artifactId>commonmark</artifactId>
-        <version>0.21.0</version>
+        <version>0.24.0</version>
       </dependency>
       <dependency>
         <groupId>org.junit.jupiter</groupId>
@@ -130,7 +127,7 @@
       <dependency>
         <groupId>org.mockito</groupId>
         <artifactId>mockito-core</artifactId>
-        <version>4.9.0</version>
+        <version>5.15.2</version>
         <scope>test</scope>
       </dependency>
     </dependencies>
@@ -164,7 +161,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>buildnumber-maven-plugin</artifactId>
-        <version>3.0.0</version>
+        <version>3.2.1</version>
         <executions>
           <execution>
             <phase>validate</phase>
@@ -177,13 +174,19 @@
       <plugin>
         <groupId>com.diffplug.spotless</groupId>
         <artifactId>spotless-maven-plugin</artifactId>
-        <version>2.28.0</version>
+        <version>2.44.1</version>
         <configuration>
           <java>
+            <includes>
+              <include>*.java</include>
+            </includes>
+            <excludes>
+              <exclude>planetiler-openmaptiles/**/*.java</exclude>
+            </excludes>
             <importOrder/>
             <removeUnusedImports/>
             <eclipse>
-              <version>4.21.0</version>
+              <version>4.33</version>
               <!--suppress UnresolvedMavenProperty -->
               <file>${maven.multiModuleProjectDirectory}/eclipse-formatter.xml</file>
             </eclipse>
@@ -208,11 +211,11 @@
           </execution>
         </executions>
       </plugin>
-      <!-- require building with jdk 16 -->
+      <!-- require building with jdk 21 -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-enforcer-plugin</artifactId>
-        <version>3.1.0</version>
+        <version>3.5.0</version>
         <executions>
           <execution>
             <id>enforce-java</id>
@@ -222,7 +225,7 @@
             <configuration>
               <rules>
                 <requireJavaVersion>
-                  <version>16</version>
+                  <version>21</version>
                 </requireJavaVersion>
               </rules>
             </configuration>
@@ -232,23 +235,52 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.0.0-M7</version>
-        <!-- by default surefire excludes tests on nested classes https://github.com/junit-team/junit5/issues/1377 -->
+        <version>3.5.2</version>
         <configuration>
+          <!-- by default surefire excludes tests on nested classes https://github.com/junit-team/junit5/issues/1377 -->
           <excludes>
             <exclude/>
           </excludes>
+          <!-- by default surefire only includes tests matching Test*.java *Test.java or *TestCase.java -->
+          <includes>
+            <include>**/*.java</include>
+          </includes>
         </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
-        <version>3.0.0-M7</version>
+        <version>3.5.2</version>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-deploy-plugin</artifactId>
-        <version>3.0.0</version>
+        <version>3.1.3</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-proc:full</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar-no-fork</goal>
+              <goal>test-jar-no-fork</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
 
@@ -257,7 +289,7 @@
         <plugin>
           <groupId>io.github.zlika</groupId>
           <artifactId>reproducible-build-maven-plugin</artifactId>
-          <version>0.16</version>
+          <version>0.17</version>
           <executions>
             <execution>
               <id>run-when-packaged</id>
@@ -272,7 +304,7 @@
         <plugin>
           <groupId>com.google.cloud.tools</groupId>
           <artifactId>jib-maven-plugin</artifactId>
-          <version>3.3.1</version>
+          <version>3.4.4</version>
           <configuration>
             <skip>true</skip>
           </configuration>
@@ -281,7 +313,7 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-javadoc-plugin</artifactId>
-          <version>3.4.1</version>
+          <version>3.11.2</version>
           <configuration>
             <quiet>true</quiet>
             <doclint>-missing</doclint>
@@ -297,31 +329,15 @@
             </execution>
           </executions>
         </plugin>
-
-        <plugin>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-source-plugin</artifactId>
-          <version>3.2.1</version>
-          <executions>
-            <execution>
-              <id>attach-sources</id>
-              <phase>package</phase>
-              <goals>
-                <goal>jar-no-fork</goal>
-                <goal>test-jar-no-fork</goal>
-              </goals>
-            </execution>
-          </executions>
-        </plugin>
         <plugin>
           <groupId>org.sonarsource.scanner.maven</groupId>
           <artifactId>sonar-maven-plugin</artifactId>
-          <version>3.9.1.2184</version>
+          <version>5.0.0.4389</version>
         </plugin>
         <plugin>
           <groupId>org.jacoco</groupId>
           <artifactId>jacoco-maven-plugin</artifactId>
-          <version>0.8.8</version>
+          <version>0.8.12</version>
         </plugin>
       </plugins>
     </pluginManagement>
@@ -382,26 +398,13 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-gpg-plugin</artifactId>
-            <version>3.0.1</version>
+            <version>3.2.7</version>
             <executions>
               <execution>
                 <id>sign-artifacts</id>
                 <phase>verify</phase>
                 <goals>
                   <goal>sign</goal>
-                </goals>
-              </execution>
-            </executions>
-          </plugin>
-          <plugin>
-            <groupId>org.apache.maven.plugins</groupId>
-            <artifactId>maven-source-plugin</artifactId>
-            <executions>
-              <execution>
-                <id>attach-sources</id>
-                <goals>
-                  <goal>jar-no-fork</goal>
-                  <goal>test-jar-no-fork</goal>
                 </goals>
               </execution>
             </executions>
@@ -417,7 +420,7 @@
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>flatten-maven-plugin</artifactId>
-            <version>1.3.0</version>
+            <version>1.6.0</version>
             <configuration>
               <updatePomFile>true</updatePomFile>
               <flattenMode>resolveCiFriendliesOnly</flattenMode>
@@ -438,6 +441,22 @@
                 </goals>
               </execution>
             </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- run with -Pfast to skip slow tests -->
+    <profile>
+      <id>fast</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <groups>!slow</groups>
+              <forkCount>1C</forkCount>
+            </configuration>
           </plugin>
         </plugins>
       </build>

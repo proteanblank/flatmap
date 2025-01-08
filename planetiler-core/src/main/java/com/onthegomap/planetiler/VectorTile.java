@@ -26,17 +26,25 @@ import com.onthegomap.planetiler.geo.GeoUtils;
 import com.onthegomap.planetiler.geo.GeometryException;
 import com.onthegomap.planetiler.geo.GeometryType;
 import com.onthegomap.planetiler.geo.MutableCoordinateSequence;
+import com.onthegomap.planetiler.reader.WithTags;
+import com.onthegomap.planetiler.util.Hilbert;
+import com.onthegomap.planetiler.util.LayerAttrStats;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.concurrent.NotThreadSafe;
 import org.locationtech.jts.algorithm.Orientation;
+import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.CoordinateSequence;
+import org.locationtech.jts.geom.CoordinateXY;
 import org.locationtech.jts.geom.Geometry;
 import org.locationtech.jts.geom.GeometryFactory;
 import org.locationtech.jts.geom.LineString;
@@ -69,13 +77,16 @@ import vector_tile.VectorTileProto;
  */
 @NotThreadSafe
 public class VectorTile {
+  public static final long NO_FEATURE_ID = 0;
 
   private static final Logger LOGGER = LoggerFactory.getLogger(VectorTile.class);
 
   // TODO make these configurable
   private static final int EXTENT = 4096;
   private static final double SIZE = 256d;
-  private final Map<String, Layer> layers = new LinkedHashMap<>();
+  // use a treemap to ensure that layers are encoded in a consistent order
+  private final Map<String, Layer> layers = new TreeMap<>();
+  private LayerAttrStats.Updater.ForZoom layerStatsTracker = LayerAttrStats.Updater.ForZoom.NOOP;
 
   private static int[] getCommands(Geometry input, int scale) {
     var encoder = new CommandEncoder(scale);
@@ -176,7 +187,7 @@ public class VectorTile {
     return result.toArray();
   }
 
-  private static int zigZagEncode(int n) {
+  static int zigZagEncode(int n) {
     // https://developers.google.com/protocol-buffers/docs/encoding#types
     return (n << 1) ^ (n >> 31);
   }
@@ -206,6 +217,11 @@ public class VectorTile {
           length = commands[i++];
           command = length & ((1 << 3) - 1);
           length = length >> 3;
+          assert geomType != GeometryType.POINT || i == 1 : "Invalid multipoint, command found at index %d, expected 0"
+            .formatted(i);
+          assert geomType != GeometryType.POINT ||
+            (length * 2 + 1 == geometryCount) : "Invalid multipoint: int[%d] length=%d".formatted(geometryCount,
+              length);
         }
 
         if (length > 0) {
@@ -254,7 +270,7 @@ public class VectorTile {
             lineStrings.add(gf.createLineString(coordSeq));
           }
           if (lineStrings.size() == 1) {
-            geometry = lineStrings.get(0);
+            geometry = lineStrings.getFirst();
           } else if (lineStrings.size() > 1) {
             geometry = gf.createMultiLineString(lineStrings.toArray(new LineString[0]));
           }
@@ -296,12 +312,12 @@ public class VectorTile {
           }
           List<Polygon> polygons = new ArrayList<>();
           for (List<LinearRing> rings : polygonRings) {
-            LinearRing shell = rings.get(0);
+            LinearRing shell = rings.getFirst();
             LinearRing[] holes = rings.subList(1, rings.size()).toArray(new LinearRing[rings.size() - 1]);
             polygons.add(gf.createPolygon(shell, holes));
           }
           if (polygons.size() == 1) {
-            geometry = polygons.get(0);
+            geometry = polygons.getFirst();
           }
           if (polygons.size() > 1) {
             geometry = gf.createMultiPolygon(GeometryFactory.toPolygonArray(polygons));
@@ -367,7 +383,7 @@ public class VectorTile {
 
         for (VectorTileProto.Tile.Feature feature : layer.getFeaturesList()) {
           int tagsCount = feature.getTagsCount();
-          Map<String, Object> attrs = new HashMap<>(tagsCount / 2);
+          Map<String, Object> attrs = HashMap.newHashMap(tagsCount / 2);
           int tagIdx = 0;
           while (tagIdx < feature.getTagsCount()) {
             String key = keys.get(feature.getTags(tagIdx++));
@@ -405,32 +421,96 @@ public class VectorTile {
   }
 
   /**
+   * Returns a new {@link VectorGeometryMerger} that combines encoded geometries of the same type into a merged
+   * multipoint, multilinestring, or multipolygon.
+   */
+  public static VectorGeometryMerger newMerger(GeometryType geometryType) {
+    return new VectorGeometryMerger(geometryType);
+  }
+
+  /**
+   * Returns the hilbert index of the zig-zag-encoded first point of {@code geometry}.
+   * <p>
+   * This can be useful for sorting geometries to minimize encoded vector tile geometry command size since smaller
+   * offsets take fewer bytes using protobuf varint encoding.
+   */
+  public static int hilbertIndex(Geometry geometry) {
+    Coordinate coord = geometry.getCoordinate();
+    int x = zigZagEncode((int) Math.round(coord.x * 4096 / 256));
+    int y = zigZagEncode((int) Math.round(coord.y * 4096 / 256));
+    return Hilbert.hilbertXYToIndex(15, x, y);
+  }
+
+  /**
+   * Returns the number of internal geometries in this feature including points/lines/polygons inside multigeometries.
+   */
+  public static int countGeometries(VectorTileProto.Tile.Feature feature) {
+    int result = 0;
+    int idx = 0;
+    int geomCount = feature.getGeometryCount();
+    while (idx < geomCount) {
+      int length = feature.getGeometry(idx);
+      int command = length & ((1 << 3) - 1);
+      length = length >> 3;
+      if (command == Command.MOVE_TO.value) {
+        result += length;
+      }
+      idx += 1;
+      if (command != Command.CLOSE_PATH.value) {
+        idx += length * 2;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Returns the encoded geometry for a polygon that fills an entire tile plus {@code buffer} pixels as a shortcut to
+   * avoid needing to create an extra JTS geometry for encoding.
+   */
+  public static VectorGeometry encodeFill(double buffer) {
+    int min = (int) Math.round(EXTENT * buffer / 256d);
+    int width = EXTENT + min + min;
+    return new VectorGeometry(new int[]{
+      CommandEncoder.commandAndLength(Command.MOVE_TO, 1),
+      zigZagEncode(-min), zigZagEncode(-min),
+      CommandEncoder.commandAndLength(Command.LINE_TO, 3),
+      zigZagEncode(width), 0,
+      0, zigZagEncode(width),
+      zigZagEncode(-width), 0,
+      CommandEncoder.commandAndLength(Command.CLOSE_PATH, 1)
+    }, GeometryType.POLYGON, 0);
+  }
+
+  /**
    * Adds features in a layer to this tile.
    *
    * @param layerName name of the layer in this tile to add the features to
    * @param features  features to add to the tile
    * @return this encoder for chaining
    */
-  public VectorTile addLayerFeatures(String layerName, List<? extends Feature> features) {
+  public VectorTile addLayerFeatures(String layerName, List<Feature> features) {
     if (features.isEmpty()) {
       return this;
     }
-
     Layer layer = layers.get(layerName);
     if (layer == null) {
       layer = new Layer();
       layers.put(layerName, layer);
     }
+    var statsTracker = layerStatsTracker.forLayer(layerName);
 
     for (Feature inFeature : features) {
       if (inFeature != null && inFeature.geometry().commands().length > 0) {
         EncodedFeature outFeature = new EncodedFeature(inFeature);
 
-        for (Map.Entry<String, ?> e : inFeature.attrs().entrySet()) {
+        for (Map.Entry<String, ?> e : inFeature.tags().entrySet()) {
           // skip attribute without value
           if (e.getValue() != null) {
-            outFeature.tags.add(layer.key(e.getKey()));
-            outFeature.tags.add(layer.value(e.getValue()));
+            String key = e.getKey();
+            Object value = e.getValue();
+            outFeature.tags.add(layer.key(key));
+            outFeature.tags.add(layer.value(value));
+            statsTracker.accept(key, value);
           }
         }
 
@@ -441,11 +521,9 @@ public class VectorTile {
   }
 
   /**
-   * Creates a vector tile protobuf with all features in this tile and serializes it as a byte array.
-   * <p>
-   * Does not compress the result.
+   * Returns a vector tile protobuf object with all features in this tile.
    */
-  public byte[] encode() {
+  public VectorTileProto.Tile toProto() {
     VectorTileProto.Tile.Builder tile = VectorTileProto.Tile.newBuilder();
     for (Map.Entry<String, Layer> e : layers.entrySet()) {
       String layerName = e.getKey();
@@ -459,20 +537,14 @@ public class VectorTile {
 
       for (Object value : layer.values()) {
         VectorTileProto.Tile.Value.Builder tileValue = VectorTileProto.Tile.Value.newBuilder();
-        if (value instanceof String stringValue) {
-          tileValue.setStringValue(stringValue);
-        } else if (value instanceof Integer intValue) {
-          tileValue.setSintValue(intValue);
-        } else if (value instanceof Long longValue) {
-          tileValue.setSintValue(longValue);
-        } else if (value instanceof Float floatValue) {
-          tileValue.setFloatValue(floatValue);
-        } else if (value instanceof Double doubleValue) {
-          tileValue.setDoubleValue(doubleValue);
-        } else if (value instanceof Boolean booleanValue) {
-          tileValue.setBoolValue(booleanValue);
-        } else {
-          tileValue.setStringValue(value.toString());
+        switch (value) {
+          case String stringValue -> tileValue.setStringValue(stringValue);
+          case Integer intValue -> tileValue.setSintValue(intValue);
+          case Long longValue -> tileValue.setSintValue(longValue);
+          case Float floatValue -> tileValue.setFloatValue(floatValue);
+          case Double doubleValue -> tileValue.setDoubleValue(doubleValue);
+          case Boolean booleanValue -> tileValue.setBoolValue(booleanValue);
+          case Object other -> tileValue.setStringValue(other.toString());
         }
         tileLayer.addValues(tileValue.build());
       }
@@ -483,7 +555,7 @@ public class VectorTile {
           .setType(feature.geometry().geomType().asProtobufType())
           .addAllGeometry(Ints.asList(feature.geometry().commands()));
 
-        if (feature.id >= 0) {
+        if (feature.id != NO_FEATURE_ID) {
           featureBuilder.setId(feature.id);
         }
 
@@ -492,7 +564,16 @@ public class VectorTile {
 
       tile.addLayers(tileLayer.build());
     }
-    return tile.build().toByteArray();
+    return tile.build();
+  }
+
+  /**
+   * Creates a vector tile protobuf with all features in this tile and serializes it as a byte array.
+   * <p>
+   * Does not compress the result.
+   */
+  public byte[] encode() {
+    return toProto().toByteArray();
   }
 
   /**
@@ -523,7 +604,34 @@ public class VectorTile {
     return !empty;
   }
 
-  private enum Command {
+  /**
+   * Determine whether a tile is likely to be a duplicate of some other tile hence it makes sense to calculate a hash
+   * for it.
+   * <p>
+   * Deduplication code is aiming for a balance between filtering-out all duplicates and not spending too much CPU on
+   * hash calculations: calculating hashes for all tiles costs too much CPU, not calculating hashes at all means
+   * generating archives which are too big. This method is responsible for achieving that balance.
+   * <p>
+   * Current understanding is, that for the whole planet, there are 267m total tiles and 38m unique tiles. The
+   * {@link #containsOnlyFillsOrEdges()} heuristic catches >99.9% of repeated tiles and cuts down the number of tile
+   * hashes we need to track by 98% (38m to 735k). So it is considered a good tradeoff.
+   *
+   * @return {@code true} if the tile might have duplicates hence we want to calculate a hash for it
+   */
+  public boolean likelyToBeDuplicated() {
+    return layers.values().stream().allMatch(v -> v.encodedFeatures.isEmpty()) || containsOnlyFillsOrEdges();
+  }
+
+  /**
+   * Call back to {@code layerStats} as vector tile features are being encoded in
+   * {@link #addLayerFeatures(String, List)} to track attribute types present on features in each layer, for example to
+   * emit in tilejson metadata stats.
+   */
+  public void trackLayerStats(LayerAttrStats.Updater.ForZoom layerStats) {
+    this.layerStatsTracker = layerStats;
+  }
+
+  enum Command {
     MOVE_TO(1),
     LINE_TO(2),
     CLOSE_PATH(7);
@@ -536,14 +644,93 @@ public class VectorTile {
   }
 
   /**
-   * A vector tile encoded as a list of commands according to the
+   * Utility that combines encoded geometries of the same type into a merged multipoint, multilinestring, or
+   * multipolygon.
+   */
+  public static class VectorGeometryMerger implements Consumer<VectorGeometry> {
+    // For the most part this just concatenates the individual command arrays together
+    // EXCEPT we need to adjust the first coordinate of each subsequent linestring to
+    // be an offset from the end of the previous linestring.
+    // AND we need to combine all multipoint "move to" commands into one at the start of
+    // the sequence
+
+    private final GeometryType geometryType;
+    private final IntArrayList result = new IntArrayList();
+    private int overallX = 0;
+    private int overallY = 0;
+
+    private VectorGeometryMerger(GeometryType geometryType) {
+      this.geometryType = geometryType;
+    }
+
+    @Override
+    public void accept(VectorGeometry vectorGeometry) {
+      if (vectorGeometry.geomType != geometryType) {
+        throw new IllegalArgumentException(
+          "Cannot merge a " + vectorGeometry.geomType.name().toLowerCase(Locale.ROOT) + " geometry into a multi" +
+            vectorGeometry.geomType.name().toLowerCase(Locale.ROOT));
+      }
+      if (vectorGeometry.isEmpty()) {
+        return;
+      }
+      var commands = vectorGeometry.unscale().commands();
+      int x = 0;
+      int y = 0;
+
+      int geometryCount = commands.length;
+      int length = 0;
+      int command = 0;
+      int i = 0;
+
+      result.ensureCapacity(result.elementsCount + commands.length);
+      // and multipoints will end up with only one command ("move to" with length=# points)
+      if (geometryType != GeometryType.POINT || result.isEmpty()) {
+        result.add(commands[0]);
+      }
+      result.add(zigZagEncode(zigZagDecode(commands[1]) - overallX));
+      result.add(zigZagEncode(zigZagDecode(commands[2]) - overallY));
+      if (commands.length > 3) {
+        result.add(commands, 3, commands.length - 3);
+      }
+
+      while (i < geometryCount) {
+        if (length <= 0) {
+          length = commands[i++];
+          command = length & ((1 << 3) - 1);
+          length = length >> 3;
+        }
+
+        if (length > 0) {
+          length--;
+          if (command != Command.CLOSE_PATH.value) {
+            x += zigZagDecode(commands[i++]);
+            y += zigZagDecode(commands[i++]);
+          }
+        }
+      }
+      overallX = x;
+      overallY = y;
+    }
+
+    /** Returns the merged multi-geometry. */
+    public VectorGeometry finish() {
+      // set the correct "move to" length for multipoints based on how many points were actually added
+      if (geometryType == GeometryType.POINT) {
+        result.buffer[0] = Command.MOVE_TO.value | (((result.size() - 1) / 2) << 3);
+      }
+      return new VectorGeometry(result.toArray(), geometryType, 0);
+    }
+  }
+
+  /**
+   * A vector geometry encoded as a list of commands according to the
    * <a href="https://github.com/mapbox/vector-tile-spec/tree/master/2.1#43-geometry-encoding">vector tile
    * specification</a>.
    * <p>
    * To encode extra precision in intermediate feature geometries, the geometry contained in {@code commands} is scaled
    * to a tile extent of {@code EXTENT * 2^scale}, so when the {@code scale == 0} the extent is {@link #EXTENT} and when
    * {@code scale == 2} the extent is 4x{@link #EXTENT}. Geometries must be scaled back to 0 using {@link #unscale()}
-   * before outputting to mbtiles.
+   * before outputting to the archive.
    */
   public record VectorGeometry(int[] commands, GeometryType geomType, int scale) {
 
@@ -553,6 +740,7 @@ public class VectorTile {
     private static final int BOTTOM = 1 << 3;
     private static final int INSIDE = 0;
     private static final int ALL = TOP | LEFT | RIGHT | BOTTOM;
+    private static final VectorGeometry EMPTY_POINT = new VectorGeometry(new int[0], GeometryType.POINT, 0);
 
     public VectorGeometry {
       if (scale < 0) {
@@ -609,7 +797,7 @@ public class VectorTile {
       return decodeCommands(geomType, commands, scale);
     }
 
-    /** Returns this encoded geometry, scaled back to 0, so it is safe to emit to mbtiles output. */
+    /** Returns this encoded geometry, scaled back to 0, so it is safe to emit to archive output. */
     public VectorGeometry unscale() {
       return scale == 0 ? this : new VectorGeometry(VectorTile.unscale(commands, scale, geomType), geomType, 0);
     }
@@ -734,6 +922,105 @@ public class VectorTile {
       return visitedEnoughSides(allowEdges, visited);
     }
 
+    /** Returns true if there are no commands in this geometry. */
+    public boolean isEmpty() {
+      return commands.length == 0;
+    }
+
+    /**
+     * If this is a point, returns an empty geometry if more than {@code buffer} pixels outside the tile bounds, or if
+     * it is a multipoint than removes all points outside the buffer.
+     */
+    public VectorGeometry filterPointsOutsideBuffer(double buffer) {
+      if (geomType != GeometryType.POINT) {
+        return this;
+      }
+      IntArrayList result = null;
+
+      int extent = (EXTENT << scale);
+      int bufferInt = (int) Math.ceil(buffer * extent / 256);
+      int min = -bufferInt;
+      int max = extent + bufferInt;
+
+      int x = 0;
+      int y = 0;
+      int lastX = 0;
+      int lastY = 0;
+
+      int geometryCount = commands.length;
+      int length = 0;
+      int i = 0;
+
+      while (i < geometryCount) {
+        if (length <= 0) {
+          length = commands[i++] >> 3;
+          assert i <= 1 : "Bad index " + i;
+        }
+
+        if (length > 0) {
+          length--;
+          x += zigZagDecode(commands[i++]);
+          y += zigZagDecode(commands[i++]);
+          if (x < min || y < min || x > max || y > max) {
+            if (result == null) {
+              // short-circuit the common case of only a single point that gets filtered-out
+              if (commands.length == 3) {
+                return EMPTY_POINT;
+              }
+              result = new IntArrayList(commands.length);
+              result.add(commands, 0, i - 2);
+            }
+          } else {
+            if (result != null) {
+              result.add(zigZagEncode(x - lastX), zigZagEncode(y - lastY));
+            }
+            lastX = x;
+            lastY = y;
+          }
+        }
+      }
+      if (result != null) {
+        if (result.size() < 3) {
+          result.elementsCount = 0;
+        } else {
+          result.set(0, Command.MOVE_TO.value | (((result.size() - 1) / 2) << 3));
+        }
+
+        return new VectorGeometry(result.toArray(), geomType, scale);
+      } else {
+        return this;
+      }
+    }
+
+    /**
+     * Returns the hilbert index of the zig-zag-encoded first point of this feature.
+     * <p>
+     * This can be useful for sorting geometries to minimize encoded vector tile geometry command size since smaller
+     * offsets take fewer bytes using protobuf varint encoding.
+     */
+    public int hilbertIndex() {
+      if (commands.length < 3) {
+        return 0;
+      }
+      int x = commands[1];
+      int y = commands[2];
+      return Hilbert.hilbertXYToIndex(15, x >> scale, y >> scale);
+    }
+
+
+    /**
+     * Returns the coordinate of the first point in this geometry in tile pixel coordinates from (0,0) at the top left
+     * to (256,256) at the bottom right.
+     */
+    public CoordinateXY firstCoordinate() {
+      if (commands.length < 3) {
+        return null;
+      }
+      double factor = 1 << scale;
+      double x = zigZagDecode(commands[1]) * SIZE / EXTENT / factor;
+      double y = zigZagDecode(commands[2]) * SIZE / EXTENT / factor;
+      return new CoordinateXY(x, y);
+    }
   }
 
   /**
@@ -742,7 +1029,7 @@ public class VectorTile {
    * @param layer    the layer the feature was in
    * @param id       the feature ID
    * @param geometry the encoded feature geometry (decode using {@link VectorGeometry#decode()})
-   * @param attrs    tags for the feature to output
+   * @param tags     tags for the feature to output
    * @param group    grouping key used to limit point density or {@link #NO_GROUP} if not in a group. NOTE: this is only
    *                 populated when this feature was deserialized from {@link FeatureGroup}, not when parsed from a tile
    *                 since vector tile schema does not encode group.
@@ -751,9 +1038,9 @@ public class VectorTile {
     String layer,
     long id,
     VectorGeometry geometry,
-    Map<String, Object> attrs,
+    Map<String, Object> tags,
     long group
-  ) {
+  ) implements WithTags {
 
     public static final long NO_GROUP = Long.MIN_VALUE;
 
@@ -782,11 +1069,11 @@ public class VectorTile {
      * Returns a copy of this feature with {@code geometry} replaced with {@code newGeometry}.
      */
     public Feature copyWithNewGeometry(VectorGeometry newGeometry) {
-      return new Feature(
+      return newGeometry == geometry ? this : new Feature(
         layer,
         id,
         newGeometry,
-        attrs,
+        tags,
         group
       );
     }
@@ -797,10 +1084,16 @@ public class VectorTile {
         layer,
         id,
         geometry,
-        Stream.concat(attrs.entrySet().stream(), extraAttrs.entrySet().stream())
+        Stream.concat(tags.entrySet().stream(), extraAttrs.entrySet().stream())
           .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)),
         group
       );
+    }
+
+    /** @deprecated use {@link #tags()} instead. */
+    @Deprecated(forRemoval = true)
+    public Map<String, Object> attrs() {
+      return tags;
     }
   }
 
@@ -830,31 +1123,32 @@ public class VectorTile {
     }
 
     void accept(Geometry geometry) {
-      if (geometry instanceof MultiLineString multiLineString) {
-        for (int i = 0; i < multiLineString.getNumGeometries(); i++) {
-          encode(((LineString) multiLineString.getGeometryN(i)).getCoordinateSequence(), false, GeometryType.LINE);
+      switch (geometry) {
+        case MultiLineString multiLineString -> {
+          for (int i = 0; i < multiLineString.getNumGeometries(); i++) {
+            encode(((LineString) multiLineString.getGeometryN(i)).getCoordinateSequence(), false, GeometryType.LINE);
+          }
         }
-      } else if (geometry instanceof Polygon polygon) {
-        LineString exteriorRing = polygon.getExteriorRing();
-        encode(exteriorRing.getCoordinateSequence(), true, GeometryType.POLYGON);
-
-        for (int i = 0; i < polygon.getNumInteriorRing(); i++) {
-          LineString interiorRing = polygon.getInteriorRingN(i);
-          encode(interiorRing.getCoordinateSequence(), true, GeometryType.LINE);
+        case Polygon polygon -> {
+          LineString exteriorRing = polygon.getExteriorRing();
+          encode(exteriorRing.getCoordinateSequence(), true, GeometryType.POLYGON);
+          for (int i = 0; i < polygon.getNumInteriorRing(); i++) {
+            LineString interiorRing = polygon.getInteriorRingN(i);
+            encode(interiorRing.getCoordinateSequence(), true, GeometryType.LINE);
+          }
         }
-      } else if (geometry instanceof MultiPolygon multiPolygon) {
-        for (int i = 0; i < multiPolygon.getNumGeometries(); i++) {
-          accept(multiPolygon.getGeometryN(i));
+        case MultiPolygon multiPolygon -> {
+          for (int i = 0; i < multiPolygon.getNumGeometries(); i++) {
+            accept(multiPolygon.getGeometryN(i));
+          }
         }
-      } else if (geometry instanceof LineString lineString) {
-        encode(lineString.getCoordinateSequence(), shouldClosePath(geometry), GeometryType.LINE);
-      } else if (geometry instanceof Point point) {
-        encode(point.getCoordinateSequence(), false, GeometryType.POINT);
-      } else if (geometry instanceof Puntal) {
-        encode(new CoordinateArraySequence(geometry.getCoordinates()), shouldClosePath(geometry),
+        case LineString lineString ->
+          encode(lineString.getCoordinateSequence(), shouldClosePath(geometry), GeometryType.LINE);
+        case Point point -> encode(point.getCoordinateSequence(), false, GeometryType.POINT);
+        case Puntal ignored -> encode(new CoordinateArraySequence(geometry.getCoordinates()), shouldClosePath(geometry),
           geometry instanceof MultiPoint, GeometryType.POINT);
-      } else {
-        LOGGER.warn("Unrecognized geometry type: " + geometry.getGeometryType());
+        case null -> LOGGER.warn("Null geometry type");
+        default -> LOGGER.warn("Unrecognized geometry type: " + geometry.getGeometryType());
       }
     }
 
@@ -919,7 +1213,7 @@ public class VectorTile {
       if (lineToIndex > 0) {
         if (lineToLength == 0) {
           // remove empty LineTo
-          result.remove(lineToIndex);
+          result.removeAt(lineToIndex);
         } else {
           // update LineTo with new length
           result.set(lineToIndex, commandAndLength(Command.LINE_TO, lineToLength));

@@ -56,12 +56,12 @@ class ToiletsProfileTest {
       // Override input source locations
       "osm_path", TestUtils.pathToResource("monaco-latest.osm.pbf"),
       // Override temp dir location
-      "tmp", tmpDir.toString(),
+      "tmpdir", tmpDir.toString(),
       // Override output location
-      "mbtiles", dbPath.toString()
+      "output", dbPath.toString()
     ));
     try (Mbtiles mbtiles = Mbtiles.newReadOnlyDatabase(dbPath)) {
-      Map<String, String> metadata = mbtiles.metadata().getAll();
+      Map<String, String> metadata = mbtiles.metadata().toMap();
       assertEquals("Toilets Overlay", metadata.get("name"));
       assertContains("openstreetmap.org/copyright", metadata.get("attribution"));
 

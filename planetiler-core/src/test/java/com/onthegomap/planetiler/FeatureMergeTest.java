@@ -8,15 +8,29 @@ import com.carrotsearch.hppc.IntArrayList;
 import com.carrotsearch.hppc.IntObjectMap;
 import com.onthegomap.planetiler.collection.Hppc;
 import com.onthegomap.planetiler.geo.GeometryException;
+import com.onthegomap.planetiler.geo.GeometryPipeline;
+import com.onthegomap.planetiler.geo.GeometryType;
 import com.onthegomap.planetiler.mbtiles.Mbtiles;
+import com.onthegomap.planetiler.stats.Stats;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.function.IntFunction;
+import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.locationtech.jts.geom.Geometry;
+import org.locationtech.jts.geom.GeometryCollection;
+import org.locationtech.jts.geom.LineString;
+import org.locationtech.jts.geom.Point;
+import org.locationtech.jts.geom.Polygon;
+import org.locationtech.jts.io.ParseException;
+import org.locationtech.jts.io.WKBReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,7 +38,7 @@ class FeatureMergeTest {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(FeatureMergeTest.class);
 
-  private VectorTile.Feature feature(long id, Geometry geom, Map<String, Object> attrs) {
+  private static VectorTile.Feature feature(long id, Geometry geom, Map<String, Object> attrs) {
     return new VectorTile.Feature(
       "layer",
       id,
@@ -148,6 +162,21 @@ class FeatureMergeTest {
         ),
         0,
         1,
+        0,
+        true
+      )
+    );
+    // but doesn't resimplify if the tolerance is negative even when resimplify=true
+    assertEquals(
+      List.of(
+        feature(1, newLineString(10, 10, 20, 20, 30, 30), Map.of("a", 1))
+      ),
+      FeatureMerge.mergeLineStrings(
+        List.of(
+          feature(1, newLineString(10, 10, 20, 20, 30, 30), Map.of("a", 1))
+        ),
+        0,
+        -1,
         0,
         true
       )
@@ -344,6 +373,73 @@ class FeatureMergeTest {
       )
     );
   }
+
+  @Test
+  void geometryPipelineWhenMergingOverlappingPolygons() throws GeometryException {
+    List<VectorTile.Feature> features = List.of(
+      feature(1, rectangle(10, 10, 20, 19), Map.of("a", 1)),
+      feature(2, rectangle(11, 10, 20, 20), Map.of("a", 1))
+    );
+    assertEquivalentFeatures(
+      List.of(
+        feature(1, newPolygon(
+          10, 10,
+          20, 10,
+          20, 20,
+          11, 20,
+          // remove this point due to simplification: 11, 19,
+          10, 19,
+          10, 10
+        ), Map.of("a", 1))
+      ),
+      FeatureMerge.mergeNearbyPolygons(
+        features,
+        0,
+        0,
+        0,
+        1,
+        Stats.inMemory(),
+        GeometryPipeline.simplifyVW(1)
+      )
+    );
+  }
+
+  @Test
+  void geometryPipelineAppliedWhenMergingSinglePolygon() throws GeometryException {
+    List<VectorTile.Feature> features = List.of(
+      feature(1, newPolygon(
+        10, 10,
+        20, 10,
+        20, 20,
+        11, 20,
+        11, 19,
+        10, 19,
+        10, 10), Map.of("a", 1))
+    );
+    assertEquivalentFeatures(
+      List.of(
+        feature(1, newPolygon(
+          10, 10,
+          20, 10,
+          20, 20,
+          11, 20,
+          // remove this point due to simplification: 11, 19,
+          10, 19,
+          10, 10
+        ), Map.of("a", 1))
+      ),
+      FeatureMerge.mergeNearbyPolygons(
+        features,
+        0,
+        0,
+        0,
+        1,
+        Stats.inMemory(),
+        GeometryPipeline.simplifyVW(1)
+      )
+    );
+  }
+
 
   @Test
   void mergeMultiPolygons() throws GeometryException {
@@ -610,16 +706,17 @@ class FeatureMergeTest {
     );
   }
 
+  @Slow
   @ParameterizedTest
   @CsvSource({
     "bostonbuildings.mbtiles, 2477, 3028, 13, 1141",
-    "bostonbuildings.mbtiles, 2481, 3026, 13, 948",
+    "bostonbuildings.mbtiles, 2481, 3026, 13, 949",
     "bostonbuildings.mbtiles, 2479, 3028, 13, 1074",
     "jakartabuildings.mbtiles, 6527, 4240, 13, 410"
   })
   void testMergeManyPolygons__TAKES_A_MINUTE_OR_TWO(String file, int x, int y, int z, int expected)
     throws IOException, GeometryException {
-    LOGGER.warn("Testing complex polygon merging for " + file + " " + z + "/" + x + "/" + y + " ...");
+    LOGGER.warn("Testing complex polygon merging for {} {}/{}/{} ...", file, z, x, y);
     try (var db = Mbtiles.newReadOnlyDatabase(TestUtils.pathToResource(file))) {
       byte[] tileData = db.getTile(x, y, z);
       byte[] gunzipped = gunzip(tileData);
@@ -683,5 +780,189 @@ class FeatureMergeTest {
         0
       )
     );
+  }
+
+  @Test
+  void mergeMultipoints() throws GeometryException {
+    testMultigeometryMerger(
+      i -> newPoint(i, 2 * i),
+      items -> newMultiPoint(items.toArray(Point[]::new)),
+      rectangle(0, 1),
+      FeatureMerge::mergeMultiPoint
+    );
+  }
+
+  @Test
+  void mergeMultipolygons() throws GeometryException {
+    testMultigeometryMerger(
+      i -> rectangle(i, i + 1),
+      items -> newMultiPolygon(items.toArray(Polygon[]::new)),
+      newPoint(0, 0),
+      FeatureMerge::mergeMultiPolygon
+    );
+  }
+
+  @Test
+  void mergeMultiline() throws GeometryException {
+    testMultigeometryMerger(
+      i -> newLineString(i, i + 1, i + 2, i + 3),
+      items -> newMultiLineString(items.toArray(LineString[]::new)),
+      newPoint(0, 0),
+      FeatureMerge::mergeMultiLineString
+    );
+  }
+
+  <S extends Geometry, M extends GeometryCollection> void testMultigeometryMerger(
+    IntFunction<S> generateGeometry,
+    Function<List<S>, M> combineJTS,
+    Geometry otherGeometry,
+    UnaryOperator<List<VectorTile.Feature>> merge
+  ) throws GeometryException {
+    var geom1 = generateGeometry.apply(1);
+    var geom2 = generateGeometry.apply(2);
+    var geom3 = generateGeometry.apply(3);
+    var geom4 = generateGeometry.apply(4);
+    var geom5 = generateGeometry.apply(5);
+
+    assertTopologicallyEquivalentFeatures(
+      List.of(),
+      merge.apply(List.of())
+    );
+
+    assertTopologicallyEquivalentFeatures(
+      List.of(
+        feature(1, geom1, Map.of("a", 1))
+      ),
+      merge.apply(
+        List.of(
+          feature(1, geom1, Map.of("a", 1))
+        )
+      )
+    );
+
+    assertTopologicallyEquivalentFeatures(
+      List.of(
+        feature(4, otherGeometry, Map.of("a", 1)),
+        feature(1, combineJTS.apply(List.of(geom1, geom2, geom3, geom4)), Map.of("a", 1)),
+        feature(3, geom5, Map.of("a", 2))
+      ),
+      merge.apply(
+        List.of(
+          feature(1, combineJTS.apply(List.of(geom1, geom2)), Map.of("a", 1)),
+          feature(2, combineJTS.apply(List.of(geom3, geom4)), Map.of("a", 1)),
+          feature(3, geom5, Map.of("a", 2)),
+          feature(4, otherGeometry, Map.of("a", 1)),
+          new VectorTile.Feature("layer", 5, new VectorTile.VectorGeometry(new int[0], GeometryType.typeOf(geom1), 0),
+            Map.of("a", 1))
+        )
+      )
+    );
+  }
+
+  @Test
+  void removePointsOutsideBufferEmpty() {
+    assertEquals(
+      List.of(),
+      FeatureMerge.removePointsOutsideBuffer(List.of(), 4d)
+    );
+  }
+
+  @Test
+  void removePointsOutsideBufferSinglePoints() throws GeometryException {
+    assertEquals(
+      List.of(),
+      FeatureMerge.removePointsOutsideBuffer(List.of(), 4d)
+    );
+    assertTopologicallyEquivalentFeatures(
+      List.of(
+        feature(1, newPoint(0, 0), Map.of()),
+        feature(1, newPoint(256, 256), Map.of()),
+        feature(1, newPoint(-4, -4), Map.of()),
+        feature(1, newPoint(-4, 260), Map.of()),
+        feature(1, newPoint(260, -4), Map.of()),
+        feature(1, newPoint(260, 260), Map.of())
+      ),
+      FeatureMerge.removePointsOutsideBuffer(
+        List.of(
+          feature(1, newPoint(0, 0), Map.of()),
+          feature(1, newPoint(256, 256), Map.of()),
+          feature(1, newPoint(-4, -4), Map.of()),
+          feature(1, newPoint(-4, 260), Map.of()),
+          feature(1, newPoint(260, -4), Map.of()),
+          feature(1, newPoint(260, 260), Map.of()),
+          feature(1, newPoint(-5, -5), Map.of()),
+          feature(1, newPoint(-5, 261), Map.of()),
+          feature(1, newPoint(261, -5), Map.of()),
+          feature(1, newPoint(261, 261), Map.of())
+        ),
+        4d
+      )
+    );
+  }
+
+  @Test
+  void removePointsOutsideBufferMultiPoints() throws GeometryException {
+    assertEquals(
+      List.of(),
+      FeatureMerge.removePointsOutsideBuffer(List.of(), 4d)
+    );
+    assertTopologicallyEquivalentFeatures(
+      List.of(
+        feature(1, newMultiPoint(
+          newPoint(0, 0),
+          newPoint(256, 256),
+          newPoint(-4, -4),
+          newPoint(-4, 260),
+          newPoint(260, -4),
+          newPoint(260, 260)
+        ), Map.of())
+      ),
+      FeatureMerge.removePointsOutsideBuffer(
+        List.of(
+          feature(1, newMultiPoint(
+            newPoint(0, 0),
+            newPoint(256, 256),
+            newPoint(-4, -4),
+            newPoint(-4, 260),
+            newPoint(260, -4),
+            newPoint(260, 260),
+            newPoint(-5, -5),
+            newPoint(-5, 261),
+            newPoint(261, -5),
+            newPoint(261, 261)
+          ), Map.of()),
+          feature(1, newMultiPoint(
+            newPoint(-5, -5),
+            newPoint(-5, 261),
+            newPoint(261, -5),
+            newPoint(261, 261)
+          ), Map.of())
+        ),
+        4d
+      )
+    );
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {
+    "/issue_700/exception_1.wkb",
+    "/issue_700/exception_2.wkb",
+    "/issue_700/exception_3.wkb",
+    "/issue_700/exception_4.wkb",
+    "/issue_700/exception_5.wkb",
+    "/issue_700/exception_6.wkb",
+    "/issue_700/exception_7.wkb",
+    "/issue_700/exception_8.wkb",
+    "/issue_700/exception_9.wkb",
+  })
+  void testIssue700BufferUnionUnbufferFailure(String path) throws IOException, ParseException {
+    try (var is = getClass().getResource(path).openStream()) {
+      GeometryCollection collection = (GeometryCollection) new WKBReader().read(is.readAllBytes());
+      List<Geometry> geometries = new ArrayList<>();
+      for (int i = 0; i < collection.getNumGeometries(); i++) {
+        geometries.add(collection.getGeometryN(i));
+      }
+      FeatureMerge.bufferUnionUnbuffer(0.5, geometries, Stats.inMemory());
+    }
   }
 }

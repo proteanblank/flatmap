@@ -1,6 +1,5 @@
 package com.onthegomap.planetiler.stats;
 
-import com.onthegomap.planetiler.util.FileUtils;
 import com.onthegomap.planetiler.util.MemoryEstimator;
 import io.prometheus.client.Collector;
 import io.prometheus.client.CollectorRegistry;
@@ -23,6 +22,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -48,7 +48,8 @@ class PrometheusStats implements Stats {
   private PushGateway pg;
   private ScheduledExecutorService executor;
   private final String job;
-  private final Map<String, Path> filesToMonitor = new ConcurrentSkipListMap<>();
+  private final Map<String, MonitoredFile> filesToMonitor = new ConcurrentSkipListMap<>();
+  private final Map<String, Long> dataErrorCounters = new ConcurrentHashMap<>();
   private final Map<String, MemoryEstimator.HasEstimate> heapObjectsToMonitor = new ConcurrentSkipListMap<>();
 
   /** Constructs a new instance but does not start polling (for tests). */
@@ -113,12 +114,12 @@ class PrometheusStats implements Stats {
 
   private final io.prometheus.client.Counter processedElements = io.prometheus.client.Counter
     .build(BASE + "renderer_elements_processed", "Number of source elements processed")
-    .labelNames("type", "layer")
+    .labelNames("type", "layer", "zoom")
     .register(registry);
 
   @Override
-  public void processedElement(String elemType, String layer) {
-    processedElements.labels(elemType, layer).inc();
+  public void processedElement(String elemType, String layer, int zoom) {
+    processedElements.labels(elemType, layer, String.valueOf(zoom)).inc();
   }
 
   private final io.prometheus.client.Counter dataErrors = io.prometheus.client.Counter
@@ -128,6 +129,7 @@ class PrometheusStats implements Stats {
 
   @Override
   public void dataError(String errorCode) {
+    Stats.super.dataError(errorCode);
     dataErrors.labels(errorCode).inc();
   }
 
@@ -152,7 +154,7 @@ class PrometheusStats implements Stats {
   }
 
   private final Histogram tilesWrittenBytes = Histogram
-    .build(BASE + "mbtiles_tile_written_bytes", "Written tile sizes by zoom level")
+    .build(BASE + "archive_tile_written_bytes", "Written tile sizes by zoom level")
     .buckets(1_000, 10_000, 100_000, 500_000)
     .labelNames("zoom")
     .register(registry);
@@ -168,7 +170,7 @@ class PrometheusStats implements Stats {
   }
 
   @Override
-  public Map<String, Path> monitoredFiles() {
+  public Map<String, MonitoredFile> monitoredFiles() {
     return filesToMonitor;
   }
 
@@ -201,6 +203,11 @@ class PrometheusStats implements Stats {
         return result;
       }
     }.register(registry);
+  }
+
+  @Override
+  public Map<String, Long> dataErrors() {
+    return dataErrorCounters;
   }
 
   @Override
@@ -240,11 +247,13 @@ class PrometheusStats implements Stats {
     @Override
     public List<MetricFamilySamples> collect() {
       List<Collector.MetricFamilySamples> results = new ArrayList<>();
-      for (var file : filesToMonitor.entrySet()) {
-        String name = sanitizeMetricName(file.getKey());
-        Path path = file.getValue();
+      for (var entry : filesToMonitor.entrySet()) {
+        String name = sanitizeMetricName(entry.getKey());
+        MonitoredFile monitoredFile = entry.getValue();
+        Path path = monitoredFile.path();
+        long size = monitoredFile.sizeProvider().getAsLong();
         results.add(new GaugeMetricFamily(BASE + "file_" + name + "_size_bytes", "Size of " + name + " in bytes",
-          FileUtils.size(path)));
+          size));
         if (Files.exists(path)) {
           try {
             FileStore fileStore = Files.getFileStore(path);

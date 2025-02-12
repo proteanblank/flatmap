@@ -1,12 +1,15 @@
 package com.onthegomap.planetiler;
 
+import com.onthegomap.planetiler.expression.Expression;
 import com.onthegomap.planetiler.geo.GeometryException;
+import com.onthegomap.planetiler.geo.TileCoord;
 import com.onthegomap.planetiler.mbtiles.Mbtiles;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import com.onthegomap.planetiler.reader.osm.OsmElement;
 import com.onthegomap.planetiler.reader.osm.OsmRelationInfo;
 import com.onthegomap.planetiler.util.Wikidata;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 
 /**
@@ -30,8 +33,17 @@ import java.util.function.Consumer;
  * For complex profiles, {@link ForwardingProfile} provides a framework for splitting the logic up into several handlers
  * (i.e. one per layer) and forwarding each element/event to the handlers that care about it.
  */
-public interface Profile {
-  // TODO might want to break this apart into sub-interfaces that ForwardingProfile (and MbtilesMetadata) can use too
+public interface Profile extends FeatureProcessor<SourceFeature> {
+  // TODO might want to break this apart into sub-interfaces that ForwardingProfile (and TileArchiveMetadata) can use too
+
+  /**
+   * Default attribution recommended for profiles using OpenStreetMap data
+   *
+   * @see <a href="https://www.openstreetmap.org/copyright">www.openstreetmap.org/copyright</a>
+   */
+  String OSM_ATTRIBUTION = """
+    <a href="https://www.openstreetmap.org/copyright" target="_blank">&copy; OpenStreetMap contributors</a>
+    """.trim();
 
   /**
    * Allows profile to extract any information it needs from a {@link OsmElement.Node} during the first pass through OSM
@@ -69,19 +81,6 @@ public interface Profile {
     return null;
   }
 
-  /**
-   * Generates output features for any input feature that should appear in the map.
-   * <p>
-   * Multiple threads may invoke this method concurrently for a single data source so implementations should ensure
-   * thread-safe access to any shared data structures. Separate data sources are processed sequentially.
-   * <p>
-   * All OSM nodes are processed first, then ways, then relations.
-   *
-   * @param sourceFeature the input feature from a source dataset (OSM element, shapefile element, etc.)
-   * @param features      a collector for generating output map features to emit
-   */
-  void processFeature(SourceFeature sourceFeature, FeatureCollector features);
-
   /** Free any resources associated with this profile (i.e. shared data structures) */
   default void release() {}
 
@@ -102,7 +101,7 @@ public interface Profile {
    * @return the new list of output features or {@code null} to not change anything. Set any elements of the list to
    *         {@code null} if they should be ignored.
    * @throws GeometryException for any recoverable geometric operation failures - the framework will log the error, emit
-   *                           the original input features, and continue processing other tiles
+   *                           the original input features, and continue processing other layers
    */
   default List<VectorTile.Feature> postProcessLayerFeatures(String layer, int zoom,
     List<VectorTile.Feature> items) throws GeometryException {
@@ -110,11 +109,40 @@ public interface Profile {
   }
 
   /**
+   * Apply any post-processing to layers in an output tile before writing it to the output.
+   * <p>
+   * This is called before {@link #postProcessLayerFeatures(String, int, List)} gets called for each layer. Use this
+   * method if features in one layer should influence features in another layer, to create new layers from existing
+   * ones, or if you need to remove a layer entirely from the output.
+   * <p>
+   * These transformations may add, remove, or change the tags, geometry, or ordering of output features based on other
+   * features present in this tile. See {@link FeatureMerge} class for a set of common transformations that merge
+   * linestrings/polygons.
+   * <p>
+   * Many threads invoke this method concurrently so ensure thread-safe access to any shared data structures.
+   * <p>
+   * The default implementation passes through input features unaltered
+   *
+   * @param tileCoord the tile being post-processed
+   * @param layers    all the output features in each layer on this tile
+   * @return the new map from layer to features or {@code null} to not change anything. Set any elements of the lists to
+   *         {@code null} if they should be ignored.
+   * @throws GeometryException for any recoverable geometric operation failures - the framework will log the error, emit
+   *                           the original input features, and continue processing other tiles
+   */
+  default Map<String, List<VectorTile.Feature>> postProcessTileFeatures(TileCoord tileCoord,
+    Map<String, List<VectorTile.Feature>> layers) throws GeometryException {
+    return layers;
+  }
+
+  /**
    * Returns the name of the generated tileset to put into {@link Mbtiles} metadata
    *
    * @see <a href="https://github.com/mapbox/mbtiles-spec/blob/master/1.3/spec.md#metadata">MBTiles specification</a>
    */
-  String name();
+  default String name() {
+    return getClass().getSimpleName();
+  }
 
   /**
    * Returns the description of the generated tileset to put into {@link Mbtiles} metadata
@@ -155,6 +183,10 @@ public interface Profile {
    */
   default boolean isOverlay() {
     return false;
+  }
+
+  default Map<String, String> extraArchiveMetadata() {
+    return Map.of();
   }
 
   /**
@@ -213,6 +245,14 @@ public interface Profile {
    */
   default long estimateRamRequired(long osmFileSize) {
     return 0L;
+  }
+
+  /**
+   * Returns false if this profile will ignore every feature in a set where {@linkplain Expression.PartialInput partial
+   * attributes} are known ahead of time.
+   */
+  default boolean caresAbout(Expression.PartialInput input) {
+    return true;
   }
 
   /**

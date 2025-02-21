@@ -18,6 +18,7 @@ The `planetiler-core` module includes the following software:
     , [EPSG](https://github.com/geotools/geotools/blob/main/licenses/EPSG.md))
   - org.msgpack:msgpack-core (Apache license)
   - org.xerial:sqlite-jdbc (Apache license)
+  - org.xerial.snappy:snappy-java (Apache license)
   - com.ibm.icu:icu4j ([ICU license](https://github.com/unicode-org/icu/blob/main/icu4c/LICENSE))
   - com.google.guava:guava (Apache license)
   - com.google.protobuf:protobuf-java (BSD 3-Clause License)
@@ -25,6 +26,11 @@ The `planetiler-core` module includes the following software:
   - com.github.jnr:jnr-ffi (Apache license)
   - org.roaringbitmap:RoaringBitmap (Apache license)
   - org.projectnessie.cel:cel-tools (Apache license)
+  - mil.nga.geopackage:geopackage (MIT license)
+  - org.snakeyaml:snakeyaml-engine (Apache license)
+  - org.commonmark:commonmark (BSD 2-clause license)
+  - org.tukaani:xz (BSD 0-Clause License)
+  - blue.strategic.parquet:parquet-floor (Apache license)
 - Adapted code:
   - `DouglasPeuckerSimplifier` from [JTS](https://github.com/locationtech/jts) (EDL)
   - `OsmMultipolygon` from [imposm3](https://github.com/omniscale/imposm3) (Apache license)
@@ -40,14 +46,11 @@ The `planetiler-core` module includes the following software:
     from [github.com/rawrunprotected/hilbert_curves](https://github.com/rawrunprotected/hilbert_curves) (Public Domain)
   - `osmformat.proto` and `fileformat.proto` (generates `Osmformat.java` and `Fileformat.java`)
     from [openstreetmap/OSM-binary](https://github.com/openstreetmap/OSM-binary/tree/master/osmpbf) (MIT License)
-- Maven Dependencies:
-  - org.yaml:snakeyaml (Apache license)
-  - org.snakeyaml:snakeyaml-engine (Apache license)
-  - org.commonmark:commonmark (BSD 2-clause license)
-- Code adapted from OpenMapTiles (BSD 3-Clause License):
-  - `generated` package generated from OpenMapTiles
-  - All code in `layers` package ported from OpenMapTiles
-  - `LanguageUtils` ported from OpenMapTiles
+  - `VarInt` from [Bazel](https://github.com/bazelbuild/bazel) (Apache license)
+  - `SeekableInMemoryByteChannel`
+    from [Apache Commons compress](https://commons.apache.org/proper/commons-compress/apidocs/org/apache/commons/compress/utils/SeekableInMemoryByteChannel.html) (
+    Apache License)
+- [`planetiler-openmaptiles`](https://github.com/openmaptiles/planetiler-openmaptiles) submodule (BSD 3-Clause License)
 - Schema
   - The cartography and visual design features of the map tile schema are licensed
     under [CC-BY 4.0](http://creativecommons.org/licenses/by/4.0/). Products or services using maps derived from
@@ -64,4 +67,5 @@ The `planetiler-core` module includes the following software:
 | OSM Lakelines              | [MIT](https://github.com/lukasmartinelli/osm-lakelines), data from OSM [ODBL](https://www.openstreetmap.org/copyright)               | yes             | no               |
 | OSM Water Polygons         | [acknowledgement](https://osmdata.openstreetmap.de/info/license.html), data from OSM [ODBL](https://www.openstreetmap.org/copyright) | yes             | yes              |
 | Wikidata name translations | [CCO](https://www.wikidata.org/wiki/Wikidata:Licensing)                                                                              | no              | no               |
+| Overture Maps              | [Various](https://docs.overturemaps.org/attribution)                                                                                 | no              | yes              |
 

@@ -1,8 +1,11 @@
 package com.onthegomap.planetiler.config;
 
+import com.onthegomap.planetiler.archive.TileArchiveConfig;
+import com.onthegomap.planetiler.archive.TileCompression;
 import com.onthegomap.planetiler.collection.LongLongMap;
 import com.onthegomap.planetiler.collection.Storage;
 import com.onthegomap.planetiler.reader.osm.PolyFileReader;
+import com.onthegomap.planetiler.util.Parse;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
@@ -19,15 +22,14 @@ public record PlanetilerConfig(
   int featureWriteThreads,
   int featureProcessThreads,
   int featureReadThreads,
+  int tileWriteThreads,
   Duration logInterval,
   int minzoom,
   int maxzoom,
   int maxzoomForRendering,
-  boolean skipIndexCreation,
-  boolean optimizeDb,
-  boolean emitTilesInOrder,
   boolean force,
-  boolean gzipTempStorage,
+  boolean append,
+  boolean compressTempStorage,
   boolean mmapTempStorage,
   int sortMaxReaders,
   int sortMaxWriters,
@@ -39,16 +41,27 @@ public record PlanetilerConfig(
   String httpUserAgent,
   Duration httpTimeout,
   int httpRetries,
+  Duration httpRetryWait,
   long downloadChunkSizeMB,
   int downloadThreads,
+  double downloadMaxBandwidth,
   double minFeatureSizeAtMaxZoom,
   double minFeatureSizeBelowMaxZoom,
   double simplifyToleranceAtMaxZoom,
   double simplifyToleranceBelowMaxZoom,
   boolean osmLazyReads,
-  boolean compactDb,
   boolean skipFilledTiles,
-  int tileWarningSizeBytes
+  int tileWarningSizeBytes,
+  Boolean color,
+  boolean keepUnzippedSources,
+  TileCompression tileCompression,
+  boolean outputLayerStats,
+  String debugUrlPattern,
+  Path tmpDir,
+  Path tileWeights,
+  double maxPointBuffer,
+  boolean logJtsExceptions,
+  int featureSourceIdMultiplier
 ) {
 
   public static final int MIN_MINZOOM = 0;
@@ -94,7 +107,7 @@ public record PlanetilerConfig(
         Math.max(1, (threads - 16) / 32 + 1));
     int featureProcessThreads =
       arguments.getInteger("process_threads", "number of threads to use when processing input features",
-        Math.max(threads < 4 ? threads : (threads - featureWriteThreads), 1));
+        Math.max(threads < 8 ? threads : (threads - featureWriteThreads), 1));
     Bounds bounds = new Bounds(arguments.bounds("bounds", "bounds"));
     Path polygonFile =
       arguments.file("polygon", "a .poly file that limits output to tiles intersecting the shape", null);
@@ -111,6 +124,8 @@ public record PlanetilerConfig(
     int renderMaxzoom =
       arguments.getInteger("render_maxzoom", "maximum rendering zoom level up to " + MAX_MAXZOOM,
         Math.max(maxzoom, DEFAULT_MAXZOOM));
+    Path tmpDir = arguments.file("tmpdir|tmp", "temp directory", Path.of("data", "tmp"));
+
     return new PlanetilerConfig(
       arguments,
       bounds,
@@ -119,15 +134,21 @@ public record PlanetilerConfig(
       featureProcessThreads,
       arguments.getInteger("feature_read_threads", "number of threads to use when reading features at tile write time",
         threads < 32 ? 1 : 2),
+      arguments.getInteger("tile_write_threads",
+        "number of threads used to write tiles - only supported by " + Stream.of(TileArchiveConfig.Format.values())
+          .filter(TileArchiveConfig.Format::supportsConcurrentWrites).map(TileArchiveConfig.Format::id).toList(),
+        1),
       arguments.getDuration("loginterval", "time between logs", "10s"),
       minzoom,
       maxzoom,
       renderMaxzoom,
-      arguments.getBoolean("skip_mbtiles_index_creation", "skip adding index to mbtiles file", false),
-      arguments.getBoolean("optimize_db", "Vacuum analyze mbtiles after writing", false),
-      arguments.getBoolean("emit_tiles_in_order", "emit tiles in index order", true),
       arguments.getBoolean("force", "overwriting output file and ignore disk/RAM warnings", false),
-      arguments.getBoolean("gzip_temp", "gzip temporary feature storage (uses more CPU, but less disk space)", false),
+      arguments.getBoolean("append",
+        "append to the output file - only supported by " + Stream.of(TileArchiveConfig.Format.values())
+          .filter(TileArchiveConfig.Format::supportsAppend).map(TileArchiveConfig.Format::id).toList(),
+        false),
+      arguments.getBoolean("compress_temp|gzip_temp",
+        "compress temporary feature storage (uses more CPU, but less disk space)", false),
       arguments.getBoolean("mmap_temp", "use memory-mapped IO for temp feature files", true),
       arguments.getInteger("sort_max_readers", "maximum number of concurrent read threads to use when sorting chunks",
         6),
@@ -148,8 +169,11 @@ public record PlanetilerConfig(
         "Planetiler downloader (https://github.com/onthegomap/planetiler)"),
       arguments.getDuration("http_timeout", "Timeout to use when downloading files over HTTP", "30s"),
       arguments.getInteger("http_retries", "Retries to use when downloading files over HTTP", 1),
+      arguments.getDuration("http_retry_wait", "How long to wait before retrying HTTP request", "5s"),
       arguments.getLong("download_chunk_size_mb", "Size of file chunks to download in parallel in megabytes", 100),
       arguments.getInteger("download_threads", "Number of parallel threads to use when downloading each file", 1),
+      Parse.bandwidth(arguments.getString("download_max_bandwidth",
+        "Maximum bandwidth to consume when downloading files in units mb/s, mbps, kbps, etc.", "")),
       arguments.getDouble("min_feature_size_at_max_zoom",
         "Default value for the minimum size in tile pixels of features to emit at the maximum zoom level to allow for overzooming",
         256d / 4096),
@@ -165,15 +189,36 @@ public record PlanetilerConfig(
       arguments.getBoolean("osm_lazy_reads",
         "Read OSM blocks from disk in worker threads",
         true),
-      arguments.getBoolean("compact_db",
-        "Reduce the DB size by separating and deduping the tile data",
-        true),
       arguments.getBoolean("skip_filled_tiles",
         "Skip writing tiles containing only polygon fills to the output",
         false),
       (int) (arguments.getDouble("tile_warning_size_mb",
         "Maximum size in megabytes of a tile to emit a warning about",
-        1d) * 1024 * 1024)
+        1d) * 1024 * 1024),
+      arguments.getBooleanObject("color", "Color the terminal output"),
+      arguments.getBoolean("keep_unzipped",
+        "keep unzipped sources by default after reading", false),
+      TileCompression
+        .fromId(arguments.getString("tile_compression",
+          "the tile compression, one of " +
+            TileCompression.availableValues().stream().map(TileCompression::id).toList(),
+          "gzip")),
+      arguments.getBoolean("output_layerstats", "output a tsv.gz file for each tile/layer size", false),
+      arguments.getString("debug_url", "debug url to use for displaying tiles with {z} {lat} {lon} placeholders",
+        "https://onthegomap.github.io/planetiler-demo/#{z}/{lat}/{lon}"),
+      tmpDir,
+      arguments.file("tile_weights", "tsv.gz file with columns z,x,y,loads to generate weighted average tile size stat",
+        tmpDir.resolveSibling("tile_weights.tsv.gz")),
+      arguments.getDouble("max_point_buffer",
+        "Additional global limit for the max tile pixels to include points outside tile bounds of all layers. Set to a lower value to reduce tile size for " +
+          "clients that handle label collisions across tiles (most web and native clients). NOTE: Do not reduce if you need to support " +
+          "raster tile rendering",
+        Double.POSITIVE_INFINITY),
+      arguments.getBoolean("log_jts_exceptions", "Emit verbose details to debug JTS geometry errors", false),
+      arguments.getInteger("feature_source_id_multiplier",
+        "Set vector tile feature IDs to (featureId * thisValue) + sourceId " +
+          "where sourceId is 1 for OSM nodes, 2 for ways, 3 for relations, and 0 for other sources. Set to false to disable.",
+        10)
     );
   }
 

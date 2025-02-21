@@ -1,5 +1,7 @@
 package com.onthegomap.planetiler.config;
 
+import static com.onthegomap.planetiler.geo.GeoUtils.envelopeToString;
+
 import com.onthegomap.planetiler.geo.GeoUtils;
 import com.onthegomap.planetiler.geo.TileExtents;
 import com.onthegomap.planetiler.reader.osm.OsmInputFile;
@@ -17,6 +19,7 @@ import org.slf4j.LoggerFactory;
 public class Bounds {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(Bounds.class);
+  public static final Bounds WORLD = new Bounds(null);
 
   private Envelope latLon;
   private Envelope world;
@@ -24,7 +27,7 @@ public class Bounds {
 
   private Geometry shape;
 
-  Bounds(Envelope latLon) {
+  public Bounds(Envelope latLon) {
     set(latLon);
   }
 
@@ -34,6 +37,10 @@ public class Bounds {
 
   public Envelope world() {
     return world == null ? GeoUtils.WORLD_BOUNDS : world;
+  }
+
+  public boolean isWorld() {
+    return latLon == null || latLon.equals(GeoUtils.WORLD_LAT_LON_BOUNDS);
   }
 
   public TileExtents tileExtents() {
@@ -48,7 +55,10 @@ public class Bounds {
     if (latLon == null) {
       Envelope bounds = latLonProvider.getLatLonBounds();
       if (bounds != null && !bounds.isNull() && bounds.getArea() > 0) {
-        LOGGER.info("Setting map bounds from input: {}", bounds);
+        LOGGER.atInfo()
+          .setMessage("Setting map bounds from input: {}")
+          .addArgument(() -> envelopeToString(bounds))
+          .log();
         set(bounds);
       }
     }

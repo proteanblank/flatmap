@@ -5,12 +5,13 @@ import com.onthegomap.planetiler.config.Arguments;
 import com.onthegomap.planetiler.custommap.configschema.DataSourceType;
 import com.onthegomap.planetiler.custommap.configschema.SchemaConfig;
 import com.onthegomap.planetiler.custommap.expression.ParseException;
+import com.onthegomap.planetiler.util.YAML;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
  * Main driver to create maps configured by a YAML file.
- *
+ * <p>
  * Parses the config file into a {@link ConfiguredProfile}, loads sources into {@link Planetiler} runner and kicks off
  * the map generation process.
  */
@@ -54,13 +55,14 @@ public class ConfiguredMapMain {
       configureSource(planetiler, sourcesDir, source);
     }
 
-    planetiler.overwriteOutput("mbtiles", Path.of("data", "output.mbtiles")).run();
+    planetiler.overwriteOutput(Path.of("data", "output.mbtiles")).run();
   }
 
   private static void configureSource(Planetiler planetiler, Path sourcesDir, Source source) {
 
     DataSourceType sourceType = source.type();
     Path localPath = source.localPath();
+    String projection = source.projection();
     if (localPath == null) {
       if (source.url() == null) {
         throw new ParseException("Must provide either a url or path for " + source.id());
@@ -70,7 +72,9 @@ public class ConfiguredMapMain {
 
     switch (sourceType) {
       case OSM -> planetiler.addOsmSource(source.id(), localPath, source.url());
-      case SHAPEFILE -> planetiler.addShapefileSource(source.id(), localPath, source.url());
+      case SHAPEFILE -> planetiler.addShapefileSource(projection, source.id(), localPath, source.url());
+      case GEOPACKAGE -> planetiler.addGeoPackageSource(projection, source.id(), localPath, source.url());
+      case GEOJSON -> planetiler.addGeoJsonSource(source.id(), localPath, source.url());
       default -> throw new IllegalArgumentException("Unhandled source type for " + source.id() + ": " + sourceType);
     }
   }

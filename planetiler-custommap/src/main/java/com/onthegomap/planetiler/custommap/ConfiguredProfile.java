@@ -1,14 +1,16 @@
 package com.onthegomap.planetiler.custommap;
 
 import static com.onthegomap.planetiler.expression.MultiExpression.Entry;
-import static java.util.Map.entry;
 
 import com.onthegomap.planetiler.FeatureCollector;
+import com.onthegomap.planetiler.FeatureMerge;
 import com.onthegomap.planetiler.Profile;
+import com.onthegomap.planetiler.VectorTile;
 import com.onthegomap.planetiler.custommap.configschema.FeatureLayer;
 import com.onthegomap.planetiler.custommap.configschema.SchemaConfig;
 import com.onthegomap.planetiler.expression.MultiExpression;
 import com.onthegomap.planetiler.expression.MultiExpression.Index;
+import com.onthegomap.planetiler.geo.GeometryException;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -16,7 +18,6 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * A profile configured from a yml file.
@@ -24,8 +25,8 @@ import java.util.stream.Collectors;
 public class ConfiguredProfile implements Profile {
 
   private final SchemaConfig schema;
-
-  private final Map<String, Index<ConfiguredFeature>> featureLayerMatcher;
+  private final Map<String, FeatureLayer> layersById = new HashMap<>();
+  private final Index<ConfiguredFeature> featureLayerMatcher;
   private final TagValueProducer tagValueProducer;
   private final Contexts.Root rootContext;
 
@@ -40,23 +41,20 @@ public class ConfiguredProfile implements Profile {
 
     tagValueProducer = new TagValueProducer(schema.inputMappings());
 
-    Map<String, List<MultiExpression.Entry<ConfiguredFeature>>> configuredFeatureEntries = new HashMap<>();
+    List<MultiExpression.Entry<ConfiguredFeature>> configuredFeatureEntries = new ArrayList<>();
 
     for (var layer : layers) {
       String layerId = layer.id();
+      layersById.put(layerId, layer);
       for (var feature : layer.features()) {
         var configuredFeature = new ConfiguredFeature(layerId, tagValueProducer, feature, rootContext);
         var entry = new Entry<>(configuredFeature, configuredFeature.matchExpression());
-        for (var source : feature.source()) {
-          var list = configuredFeatureEntries.computeIfAbsent(source, s -> new ArrayList<>());
-          list.add(entry);
-        }
+        configuredFeatureEntries.add(entry);
       }
     }
 
-    featureLayerMatcher = configuredFeatureEntries.entrySet().stream()
-      .map(entry -> entry(entry.getKey(), MultiExpression.of(entry.getValue()).index()))
-      .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+    featureLayerMatcher = MultiExpression.of(configuredFeatureEntries).index();
+
   }
 
   @Override
@@ -72,16 +70,43 @@ public class ConfiguredProfile implements Profile {
   @Override
   public void processFeature(SourceFeature sourceFeature, FeatureCollector featureCollector) {
     var context = rootContext.createProcessFeatureContext(sourceFeature, tagValueProducer);
-    var index = featureLayerMatcher.get(sourceFeature.getSource());
-    if (index != null) {
-      var matches = index.getMatchesWithTriggers(context);
-      for (var configuredFeature : matches) {
-        configuredFeature.match().processFeature(
-          context.createPostMatchContext(configuredFeature.keys()),
-          featureCollector
-        );
-      }
+    var matches = featureLayerMatcher.getMatchesWithTriggers(context);
+    for (var configuredFeature : matches) {
+      configuredFeature.match().processFeature(
+        context.createPostMatchContext(configuredFeature.keys()),
+        featureCollector
+      );
     }
+  }
+
+  @Override
+  public List<VectorTile.Feature> postProcessLayerFeatures(String layer, int zoom,
+    List<VectorTile.Feature> items) throws GeometryException {
+    FeatureLayer featureLayer = findFeatureLayer(layer);
+
+    if (featureLayer.postProcess() == null) {
+      return items;
+    }
+
+    if (featureLayer.postProcess().mergeLineStrings() != null) {
+      var merge = featureLayer.postProcess().mergeLineStrings();
+
+      items = FeatureMerge.mergeLineStrings(items,
+        merge.minLength(), // after merging, remove lines that are still less than {minLength}px long
+        merge.tolerance(), // simplify output linestrings using a {tolerance}px tolerance
+        merge.buffer() // remove any detail more than {buffer}px outside the tile boundary
+      );
+    }
+
+    if (featureLayer.postProcess().mergePolygons() != null) {
+      var merge = featureLayer.postProcess().mergePolygons();
+
+      items = FeatureMerge.mergeOverlappingPolygons(items,
+        merge.minArea() // after merging, remove polygons that are still less than {minArea} in square tile pixels
+      );
+    }
+
+    return items;
   }
 
   @Override
@@ -92,10 +117,19 @@ public class ConfiguredProfile implements Profile {
   public List<Source> sources() {
     List<Source> sources = new ArrayList<>();
     schema.sources().forEach((key, value) -> {
-      var url = ConfigExpressionParser.tryStaticEvaluate(rootContext, value.url(), String.class).get();
-      var path = ConfigExpressionParser.tryStaticEvaluate(rootContext, value.localPath(), String.class).get();
-      sources.add(new Source(key, value.type(), url, path == null ? null : Path.of(path)));
+      var url = evaluate(value.url(), String.class);
+      var path = evaluate(value.localPath(), String.class);
+      var projection = evaluate(value.projection(), String.class);
+      sources.add(new Source(key, value.type(), url, path == null ? null : Path.of(path), projection));
     });
     return sources;
+  }
+
+  private <T> T evaluate(Object expression, Class<T> returnType) {
+    return ConfigExpressionParser.tryStaticEvaluate(rootContext, expression, returnType).get();
+  }
+
+  public FeatureLayer findFeatureLayer(String layerId) {
+    return layersById.get(layerId);
   }
 }

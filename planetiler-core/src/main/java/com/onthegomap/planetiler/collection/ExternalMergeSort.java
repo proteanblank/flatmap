@@ -9,7 +9,7 @@ import com.onthegomap.planetiler.stats.Stats;
 import com.onthegomap.planetiler.stats.Timer;
 import com.onthegomap.planetiler.util.BinPack;
 import com.onthegomap.planetiler.util.ByteBufferUtil;
-import com.onthegomap.planetiler.util.CloseableConusmer;
+import com.onthegomap.planetiler.util.CloseableConsumer;
 import com.onthegomap.planetiler.util.FileUtils;
 import com.onthegomap.planetiler.worker.WorkerPipeline;
 import java.io.BufferedInputStream;
@@ -41,12 +41,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
-import java.util.zip.Deflater;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
 import javax.annotation.concurrent.NotThreadSafe;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.xerial.snappy.SnappyInputStream;
+import org.xerial.snappy.SnappyOutputStream;
 
 /**
  * A utility that writes {@link SortableFeature SortableFeatures} to disk and uses merge sort to efficiently sort much
@@ -70,7 +69,7 @@ class ExternalMergeSort implements FeatureSort {
   private final AtomicLong features = new AtomicLong(0);
   private final List<Chunk> chunks = new CopyOnWriteArrayList<>();
   private final AtomicInteger chunkNum = new AtomicInteger(0);
-  private final boolean gzip;
+  private final boolean compress;
   private final PlanetilerConfig config;
   private final int readerLimit;
   private final int writerLimit;
@@ -88,7 +87,7 @@ class ExternalMergeSort implements FeatureSort {
         MAX_CHUNK_SIZE,
         ProcessInfo.getMaxMemoryBytes() / 3
       ),
-      config.gzipTempStorage(),
+      config.compressTempStorage(),
       config.mmapTempStorage(),
       true,
       true,
@@ -97,7 +96,7 @@ class ExternalMergeSort implements FeatureSort {
     );
   }
 
-  ExternalMergeSort(Path dir, int workers, int chunkSizeLimit, boolean gzip, boolean mmap, boolean parallelSort,
+  ExternalMergeSort(Path dir, int workers, int chunkSizeLimit, boolean compress, boolean mmap, boolean parallelSort,
     boolean madvise, PlanetilerConfig config, Stats stats) {
     this.config = config;
     this.madvise = madvise;
@@ -105,11 +104,11 @@ class ExternalMergeSort implements FeatureSort {
     this.stats = stats;
     this.parallelSort = parallelSort;
     this.chunkSizeLimit = chunkSizeLimit;
-    if (gzip && mmap) {
-      LOGGER.warn("--gzip-temp option not supported with --mmap-temp, falling back to --gzip-temp=false");
-      gzip = false;
+    if (compress && mmap) {
+      LOGGER.warn("--compress-temp option not supported with --mmap-temp, falling back to --mmap-temp=false");
+      mmap = false;
     }
-    this.gzip = gzip;
+    this.compress = compress;
     this.mmapIO = mmap;
     long memLimit = ProcessInfo.getMaxMemoryBytes() / 3;
     if (chunkSizeLimit > memLimit) {
@@ -138,7 +137,7 @@ class ExternalMergeSort implements FeatureSort {
   }
 
   @Override
-  public CloseableConusmer<SortableFeature> writerForThread() {
+  public CloseableConsumer<SortableFeature> writerForThread() {
     return new ThreadLocalWriter();
   }
 
@@ -186,7 +185,7 @@ class ExternalMergeSort implements FeatureSort {
       .sinkToConsumer("worker", workers, group -> {
         try {
           readSemaphore.acquire();
-          var chunk = group.get(0);
+          var chunk = group.getFirst();
           var others = group.stream().skip(1).toList();
           var toSort = time(reading, () -> {
             // merge all chunks into first one, and remove the others
@@ -254,7 +253,12 @@ class ExternalMergeSort implements FeatureSort {
       }
     }
 
-    return LongMerger.mergeIterators(iterators);
+    return LongMerger.mergeIterators(iterators, SortableFeature.COMPARE_BYTES);
+  }
+
+  @Override
+  public int chunksToRead() {
+    return chunks.size();
   }
 
   public int chunks() {
@@ -282,15 +286,6 @@ class ExternalMergeSort implements FeatureSort {
     void close();
   }
 
-  /** Compresses bytes with minimal impact on write performance. Equivalent to {@code gzip -1} */
-  private static class FastGzipOutputStream extends GZIPOutputStream {
-
-    public FastGzipOutputStream(OutputStream out) throws IOException {
-      super(out);
-      def.setLevel(Deflater.BEST_SPEED);
-    }
-  }
-
   /** Read all features from a chunk file using a {@link BufferedInputStream}. */
   private static class ReaderBuffered extends BaseReader {
 
@@ -298,12 +293,12 @@ class ExternalMergeSort implements FeatureSort {
     private final DataInputStream input;
     private int read = 0;
 
-    ReaderBuffered(Path path, int count, boolean gzip) {
+    ReaderBuffered(Path path, int count, boolean compress) {
       this.count = count;
       try {
         InputStream inputStream = new BufferedInputStream(Files.newInputStream(path));
-        if (gzip) {
-          inputStream = new GZIPInputStream(inputStream);
+        if (compress) {
+          inputStream = new SnappyInputStream(inputStream);
         }
         input = new DataInputStream(inputStream);
         next = readNextFeature();
@@ -344,11 +339,11 @@ class ExternalMergeSort implements FeatureSort {
 
     private final DataOutputStream out;
 
-    WriterBuffered(Path path, boolean gzip) {
+    WriterBuffered(Path path, boolean compress) {
       try {
         OutputStream rawOutputStream = new BufferedOutputStream(Files.newOutputStream(path));
-        if (gzip) {
-          rawOutputStream = new FastGzipOutputStream(rawOutputStream);
+        if (compress) {
+          rawOutputStream = new SnappyOutputStream(rawOutputStream);
         }
         this.out = new DataOutputStream(rawOutputStream);
       } catch (IOException e) {
@@ -396,7 +391,7 @@ class ExternalMergeSort implements FeatureSort {
 
   /** Writer that a single thread can use to write features independent of writers used in other threads. */
   @NotThreadSafe
-  private class ThreadLocalWriter implements CloseableConusmer<SortableFeature> {
+  private class ThreadLocalWriter implements CloseableConsumer<SortableFeature> {
 
     private Chunk currentChunk;
 
@@ -538,11 +533,11 @@ class ExternalMergeSort implements FeatureSort {
     }
 
     private Writer newWriter(Path path) {
-      return mmapIO ? new WriterMmap(path) : new WriterBuffered(path, gzip);
+      return mmapIO ? new WriterMmap(path) : new WriterBuffered(path, compress);
     }
 
     private Reader newReader() {
-      return mmapIO ? new ReaderMmap(path, itemCount) : new ReaderBuffered(path, itemCount, gzip);
+      return mmapIO ? new ReaderMmap(path, itemCount) : new ReaderBuffered(path, itemCount, compress);
     }
 
     @Override

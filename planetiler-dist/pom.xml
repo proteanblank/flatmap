@@ -14,6 +14,12 @@
 
   <properties>
     <mainClass>com.onthegomap.planetiler.Main</mainClass>
+    <!--
+    compile against an earlier version so that Main runs but can emit a more readable
+    error when running on an older version of Java
+    -->
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
     <image.version>${project.version}</image.version>
     <image>ghcr.io/onthegomap/planetiler:${image.version}</image>
     <assembly-phase>package</assembly-phase>
@@ -42,6 +48,19 @@
       <artifactId>planetiler-examples</artifactId>
       <version>${project.parent.version}</version>
     </dependency>
+    <!-- Add sources to the jar to improve IDE experience when using jar with deps -->
+    <dependency>
+      <groupId>com.onthegomap.planetiler</groupId>
+      <artifactId>planetiler-core</artifactId>
+      <version>${project.parent.version}</version>
+      <classifier>sources</classifier>
+    </dependency>
+    <dependency>
+      <groupId>org.locationtech.jts</groupId>
+      <artifactId>jts-core</artifactId>
+      <version>${jts.version}</version>
+      <classifier>sources</classifier>
+    </dependency>
   </dependencies>
 
   <build>
@@ -54,7 +73,7 @@
           <skip>false</skip>
           <from>
             <image>
-              eclipse-temurin:17-jre
+              eclipse-temurin:23-jdk
             </image>
             <platforms>
               <platform>
@@ -73,6 +92,8 @@
               </org.opencontainers.image.source>
             </labels>
             <mainClass>${mainClass}</mainClass>
+            <creationTime>${maven.build.timestamp}</creationTime>
+            <filesModificationTime>${maven.build.timestamp}</filesModificationTime>
           </container>
         </configuration>
       </plugin>
@@ -81,7 +102,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-assembly-plugin</artifactId>
-        <version>3.4.2</version>
+        <version>3.7.1</version>
         <dependencies>
           <dependency>
             <groupId>com.onthegomap.planetiler</groupId>

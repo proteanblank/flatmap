@@ -10,7 +10,11 @@ import com.onthegomap.planetiler.examples.BikeRouteOverlay;
 import com.onthegomap.planetiler.examples.OsmQaTiles;
 import com.onthegomap.planetiler.examples.ToiletsOverlay;
 import com.onthegomap.planetiler.examples.ToiletsOverlayLowLevelApi;
+import com.onthegomap.planetiler.examples.overture.OvertureBasemap;
 import com.onthegomap.planetiler.mbtiles.Verify;
+import com.onthegomap.planetiler.util.CompareArchives;
+import com.onthegomap.planetiler.util.TileSizeStats;
+import com.onthegomap.planetiler.util.TopOsmTiles;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.Map;
@@ -23,6 +27,15 @@ import org.openmaptiles.util.VerifyMonaco;
  * public static void main(String[] args)} methods of runnable classes.
  */
 public class Main {
+  static {
+    int version = Runtime.version().feature();
+    if (version < 21) {
+      System.err.println(
+        "You are using Java " + version +
+          " but Planetiler requires 21 or later, for more details on upgrading see: https://github.com/onthegomap/planetiler/blob/main/CONTRIBUTING.md");
+      System.exit(1);
+    }
+  }
 
   private static final EntryPoint DEFAULT_TASK = OpenMapTilesMain::main;
   private static final Map<String, EntryPoint> ENTRY_POINTS = Map.ofEntries(
@@ -42,6 +55,8 @@ public class Main {
     entry("example-bikeroutes", BikeRouteOverlay::main),
     entry("example-toilets", ToiletsOverlay::main),
     entry("example-toilets-lowlevel", ToiletsOverlayLowLevelApi::main),
+    entry("example-overture", OvertureBasemap::main),
+    entry("overture", OvertureBasemap::main),
 
     entry("example-qa", OsmQaTiles::main),
     entry("osm-qa", OsmQaTiles::main),
@@ -50,7 +65,10 @@ public class Main {
     entry("benchmark-longlongmap", LongLongMapBench::main),
 
     entry("verify-mbtiles", Verify::main),
-    entry("verify-monaco", VerifyMonaco::main)
+    entry("verify-monaco", VerifyMonaco::main),
+    entry("stats", TileSizeStats::main),
+    entry("top-osm-tiles", TopOsmTiles::main),
+    entry("compare", CompareArchives::main)
   );
 
   private static EntryPoint bundledSchema(String path) {

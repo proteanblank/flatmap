@@ -21,11 +21,11 @@ public class TileExtents implements Predicate<TileCoord> {
   }
 
   private static int quantizeDown(double value, int levels) {
-    return Math.max(0, Math.min(levels, (int) Math.floor(value * levels)));
+    return Math.clamp((int) Math.floor(value * levels), 0, levels);
   }
 
   private static int quantizeUp(double value, int levels) {
-    return Math.max(0, Math.min(levels, (int) Math.ceil(value * levels)));
+    return Math.clamp((int) Math.ceil(value * levels), 0, levels);
   }
 
   /** Returns a filter to tiles that intersect {@code worldBounds} (specified in world web mercator coordinates). */
@@ -52,7 +52,12 @@ public class TileExtents implements Predicate<TileCoord> {
 
       if (mercator != null) {
         Geometry scaled = AffineTransformation.scaleInstance(1 << zoom, 1 << zoom).transform(mercator);
-        TiledGeometry.CoveredTiles covered = TiledGeometry.getCoveredTiles(scaled, zoom, forZoom);
+        TiledGeometry.CoveredTiles covered;
+        try {
+          covered = TiledGeometry.getCoveredTiles(scaled, zoom, forZoom);
+        } catch (GeometryException e) {
+          throw new IllegalArgumentException("Invalid geometry: " + scaled);
+        }
         forZoom = forZoom.withShape(covered);
         LOGGER.info("prepareShapeForZoom z{} {}", zoom, covered);
       }

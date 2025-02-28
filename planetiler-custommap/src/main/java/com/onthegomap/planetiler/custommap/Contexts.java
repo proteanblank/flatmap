@@ -3,16 +3,22 @@ package com.onthegomap.planetiler.custommap;
 import com.google.api.expr.v1alpha1.Constant;
 import com.google.api.expr.v1alpha1.Decl;
 import com.google.api.expr.v1alpha1.Type;
+import com.google.common.collect.ForwardingMap;
 import com.google.protobuf.NullValue;
 import com.onthegomap.planetiler.config.Arguments;
 import com.onthegomap.planetiler.config.PlanetilerConfig;
 import com.onthegomap.planetiler.custommap.expression.ParseException;
 import com.onthegomap.planetiler.custommap.expression.ScriptContext;
 import com.onthegomap.planetiler.custommap.expression.ScriptEnvironment;
+import com.onthegomap.planetiler.custommap.expression.stdlib.GeometryVal;
 import com.onthegomap.planetiler.expression.DataType;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import com.onthegomap.planetiler.reader.WithGeometryType;
+import com.onthegomap.planetiler.reader.WithSource;
+import com.onthegomap.planetiler.reader.WithSourceLayer;
 import com.onthegomap.planetiler.reader.WithTags;
+import com.onthegomap.planetiler.reader.osm.OsmElement;
+import com.onthegomap.planetiler.reader.osm.OsmSourceFeature;
 import com.onthegomap.planetiler.util.Try;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -187,11 +193,8 @@ public class Contexts {
       argumentValues.put("minzoom", config.minzoom());
       argumentValues.put("maxzoom", config.maxzoom());
       argumentValues.put("render_maxzoom", config.maxzoomForRendering());
-      argumentValues.put("skip_mbtiles_index_creation", config.skipIndexCreation());
-      argumentValues.put("optimize_db", config.optimizeDb());
-      argumentValues.put("emit_tiles_in_order", config.emitTilesInOrder());
       argumentValues.put("force", config.force());
-      argumentValues.put("gzip_temp", config.gzipTempStorage());
+      argumentValues.put("compress_temp", config.compressTempStorage());
       argumentValues.put("mmap_temp", config.mmapTempStorage());
       argumentValues.put("sort_max_readers", config.sortMaxReaders());
       argumentValues.put("sort_max_writers", config.sortMaxWriters());
@@ -205,11 +208,11 @@ public class Contexts {
       argumentValues.put("http_retries", config.httpRetries());
       argumentValues.put("download_chunk_size_mb", config.downloadChunkSizeMB());
       argumentValues.put("download_threads", config.downloadThreads());
+      argumentValues.put("download_max_bandwidth", config.downloadMaxBandwidth());
       argumentValues.put("min_feature_size_at_max_zoom", config.minFeatureSizeAtMaxZoom());
       argumentValues.put("min_feature_size", config.minFeatureSizeBelowMaxZoom());
       argumentValues.put("simplify_tolerance_at_max_zoom", config.simplifyToleranceAtMaxZoom());
       argumentValues.put("simplify_tolerance", config.simplifyToleranceBelowMaxZoom());
-      argumentValues.put("compact_db", config.compactDb());
       argumentValues.put("skip_filled_tiles", config.skipFilledTiles());
       argumentValues.put("tile_warning_size_mb", config.tileWarningSizeBytes());
       builtInArgs = Set.copyOf(argumentValues.keySet());
@@ -285,7 +288,8 @@ public class Contexts {
    * Makes nested contexts adhere to {@link WithTags} and {@link WithGeometryType} by recursively fetching source
    * feature from the root context.
    */
-  private interface FeatureContext extends ScriptContext, WithTags, WithGeometryType, NestedContext {
+  private interface FeatureContext extends ScriptContext, WithTags, WithGeometryType, NestedContext, WithSourceLayer,
+    WithSource {
 
     default FeatureContext parent() {
       return null;
@@ -325,6 +329,16 @@ public class Contexts {
     default boolean canBePolygon() {
       return feature().canBePolygon();
     }
+
+    @Override
+    default String getSource() {
+      return feature().getSource();
+    }
+
+    @Override
+    default String getSourceLayer() {
+      return feature().getSourceLayer();
+    }
   }
 
   /**
@@ -343,6 +357,13 @@ public class Contexts {
     private static final String FEATURE_ID = "feature.id";
     private static final String FEATURE_SOURCE = "feature.source";
     private static final String FEATURE_SOURCE_LAYER = "feature.source_layer";
+    private static final String FEATURE_OSM_CHANGESET = "feature.osm_changeset";
+    private static final String FEATURE_OSM_VERSION = "feature.osm_version";
+    private static final String FEATURE_OSM_TIMESTAMP = "feature.osm_timestamp";
+    private static final String FEATURE_OSM_USER_ID = "feature.osm_user_id";
+    private static final String FEATURE_OSM_USER_NAME = "feature.osm_user_name";
+    private static final String FEATURE_OSM_TYPE = "feature.osm_type";
+    private static final String FEATURE_GEOMETRY = "feature";
 
     public static ScriptEnvironment<ProcessFeature> description(Root root) {
       return root.description()
@@ -351,7 +372,14 @@ public class Contexts {
           Decls.newVar(FEATURE_TAGS, Decls.newMapType(Decls.String, Decls.Any)),
           Decls.newVar(FEATURE_ID, Decls.Int),
           Decls.newVar(FEATURE_SOURCE, Decls.String),
-          Decls.newVar(FEATURE_SOURCE_LAYER, Decls.String)
+          Decls.newVar(FEATURE_SOURCE_LAYER, Decls.String),
+          Decls.newVar(FEATURE_OSM_CHANGESET, Decls.Int),
+          Decls.newVar(FEATURE_OSM_VERSION, Decls.Int),
+          Decls.newVar(FEATURE_OSM_TIMESTAMP, Decls.Int),
+          Decls.newVar(FEATURE_OSM_USER_ID, Decls.Int),
+          Decls.newVar(FEATURE_OSM_USER_NAME, Decls.String),
+          Decls.newVar(FEATURE_OSM_TYPE, Decls.String),
+          Decls.newVar(FEATURE_GEOMETRY, GeometryVal.PROTO_TYPE)
         );
     }
 
@@ -359,15 +387,44 @@ public class Contexts {
     public Object apply(String key) {
       if (key != null) {
         return switch (key) {
-          case FEATURE_TAGS -> tagValueProducer.mapTags(feature);
+          case FEATURE_TAGS -> mapWithDefault(tagValueProducer.mapTags(feature), NullValue.NULL_VALUE);
           case FEATURE_ID -> feature.id();
           case FEATURE_SOURCE -> feature.getSource();
           case FEATURE_SOURCE_LAYER -> wrapNullable(feature.getSourceLayer());
-          default -> null;
+          case FEATURE_GEOMETRY -> new GeometryVal(feature);
+          default -> {
+            OsmElement elem = feature instanceof OsmSourceFeature osm ? osm.originalElement() : null;
+            if (FEATURE_OSM_TYPE.equals(key)) {
+              yield elem == null ? null : elem.type().name().toLowerCase();
+            }
+            OsmElement.Info info = elem != null ? elem.info() : null;
+            yield info == null ? null : switch (key) {
+              case FEATURE_OSM_CHANGESET -> info.changeset();
+              case FEATURE_OSM_VERSION -> info.version();
+              case FEATURE_OSM_TIMESTAMP -> info.timestamp();
+              case FEATURE_OSM_USER_ID -> info.userId();
+              case FEATURE_OSM_USER_NAME -> wrapNullable(info.user());
+              default -> null;
+            };
+          }
         };
       } else {
         return null;
       }
+    }
+
+    private static <K, V> Map<K, V> mapWithDefault(Map<K, V> map, Object nullValue) {
+      return new ForwardingMap<>() {
+        @Override
+        protected Map<K, V> delegate() {
+          return map;
+        }
+
+        @Override
+        public V get(Object key) {
+          return map.getOrDefault(key, (V) nullValue);
+        }
+      };
     }
 
     public FeaturePostMatch createPostMatchContext(List<String> matchKeys) {
@@ -413,7 +470,7 @@ public class Contexts {
     }
 
     public String matchKey() {
-      return matchKeys().isEmpty() ? null : matchKeys().get(0);
+      return matchKeys().isEmpty() ? null : matchKeys().getFirst();
     }
 
     public Object matchValue() {
